@@ -1,20 +1,23 @@
 import hashlib
 import logging
 import secrets
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
 from app.database import Base, engine, get_db
-from app.db_migrate import migrate_users
+from app.db_migrate import migrate_questions, migrate_users
 from app.deps import get_current_user, require_admin
 from app.email_smtp import (
     _smtp_configured,
@@ -22,7 +25,7 @@ from app.email_smtp import (
     notify_admins_new_student,
     notify_student_email_verification,
 )
-from app.models import Question, Subject, Submission, Test, TestQuestion, User
+from app.models import Question, QuestionMath, Subject, Submission, Test, TestQuestion, User
 from app.security import (
     ACCESS_TOKEN_EXPIRE_DAYS,
     ACCESS_TOKEN_REMEMBER_DAYS,
@@ -33,11 +36,21 @@ from app.security import (
 
 _log = logging.getLogger(__name__)
 
+UPLOAD_ROOT = Path(__file__).resolve().parent.parent / "data" / "uploads"
+_MAX_IMAGE_BYTES = 2 * 1024 * 1024
+_ALLOWED_IMAGE_CT = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
     migrate_users(engine)
+    migrate_questions(engine)
     log_email_startup_hints(settings)
     _log.info(
         "Student sign-up requires working SMTP and PUBLIC_APP_BASE_URL; each new student gets a verification email "
@@ -73,6 +86,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# StaticFiles requires the directory to exist at import time (before lifespan runs).
+UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_ROOT)), name="uploads")
 
 
 # --- Auth ---
@@ -441,20 +457,67 @@ def delete_subject(subject_id: str, db: Session = Depends(get_db), _: User = Dep
 # --- Questions ---
 
 
+class QuestionMathPayload(BaseModel):
+    stem_latex: str
+    options_latex: list[str]
+    image_urls: list[str] = Field(default_factory=list)
+
+
 class QuestionCreate(BaseModel):
-    question_text: str
+    question_text: str = ""
     question_type: str
     subject_id: str
-    options: list[str]
+    options: list[str] = Field(default_factory=list)
     correct_answers: list[int]
     points: int = Field(default=1, ge=1)
+    math: QuestionMathPayload | None = None
+    shuffle_answer_options: bool = False
+    show_calculator: bool = False
+    show_periodic_table: bool = False
 
 
-def validate_and_normalize_question(db: Session, body: QuestionCreate) -> tuple[str, str, str, list[str], list[int], int]:
-    """Require full question data; return normalized values for persistence."""
-    text = body.question_text.strip()
-    if not text:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "question_text is required")
+def _math_public(q: Question) -> dict | None:
+    m = q.math_content
+    if not m:
+        return None
+    return {
+        "stem_latex": m.stem_latex,
+        "options_latex": list(m.options_latex or []),
+        "image_urls": list(m.image_urls or []),
+    }
+
+
+def _question_tool_flags(q: Question) -> dict:
+    return {
+        "shuffle_answer_options": bool(q.shuffle_answer_options),
+        "show_calculator": bool(q.show_calculator),
+        "show_periodic_table": bool(q.show_periodic_table),
+    }
+
+
+def _validate_image_urls(urls: list[str]) -> list[str]:
+    out: list[str] = []
+    if len(urls) > 12:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "at most 12 images per question")
+    for u in urls:
+        s = str(u).strip()
+        if not s:
+            continue
+        if len(s) > 2048:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "image url too long")
+        if ".." in s or not s.startswith("/uploads/"):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "invalid image url (must be a path starting with /uploads/)",
+            )
+        out.append(s)
+    return out
+
+
+def validate_and_normalize_question(
+    db: Session, body: QuestionCreate
+) -> tuple[str, str, str, list[str], list[int], int, dict | None, bool, bool, bool]:
+    """Return normalized question row fields, optional math payload, and UI tool flags."""
     qtype = body.question_type.strip()
     if qtype not in ("single_choice", "multiple_choice"):
         raise HTTPException(
@@ -466,15 +529,42 @@ def validate_and_normalize_question(db: Session, body: QuestionCreate) -> tuple[
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "subject_id is required")
     if not db.get(Subject, sid):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "subject not found")
-    opts = [str(o).strip() for o in body.options]
-    if len(opts) < 2:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "at least two options are required")
-    if any(not o for o in opts):
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "every option must have non-empty text")
+
+    math_block: dict | None = None
+    if body.math is not None:
+        plain = body.question_text.strip()
+        if not plain:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "question_text is required for math questions (paste calculator output inside $...$ as needed)",
+            )
+        opts = [str(o).strip() for o in body.math.options_latex]
+        if len(opts) < 2:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "at least two math options are required")
+        if any(not o for o in opts):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "every math option must be non-empty")
+        text = plain
+        opts_final = opts
+        # Stem lives in question_text (inline $...$ / \\(...\\)); stem_latex is not used for new saves.
+        math_block = {
+            "stem_latex": "",
+            "options_latex": opts,
+            "image_urls": _validate_image_urls(list(body.math.image_urls or [])),
+        }
+    else:
+        text = body.question_text.strip()
+        if not text:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "question_text is required")
+        opts_final = [str(o).strip() for o in body.options]
+        if len(opts_final) < 2:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "at least two options are required")
+        if any(not o for o in opts_final):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "every option must have non-empty text")
+
     ca = body.correct_answers
     if not ca:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "at least one correct answer is required")
-    if any(not isinstance(i, int) or i < 0 or i >= len(opts) for i in ca):
+    if any(not isinstance(i, int) or i < 0 or i >= len(opts_final) for i in ca):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "correct_answers must be valid option indices")
     if qtype == "single_choice":
         if len(ca) != 1:
@@ -487,20 +577,73 @@ def validate_and_normalize_question(db: Session, body: QuestionCreate) -> tuple[
             status.HTTP_400_BAD_REQUEST,
             "multiple_choice correct_answers must not contain duplicate indices",
         )
-    return text, qtype, sid, opts, ca, body.points
+    return (
+        text,
+        qtype,
+        sid,
+        opts_final,
+        ca,
+        body.points,
+        math_block,
+        body.shuffle_answer_options,
+        body.show_calculator,
+        body.show_periodic_table,
+    )
+
+
+def _persist_question_math(db: Session, question_id: str, math_block: dict | None) -> None:
+    row = db.query(QuestionMath).filter(QuestionMath.question_id == question_id).first()
+    if math_block:
+        if row:
+            row.stem_latex = math_block["stem_latex"]
+            row.options_latex = math_block["options_latex"]
+            row.image_urls = math_block["image_urls"]
+        else:
+            db.add(
+                QuestionMath(
+                    question_id=question_id,
+                    stem_latex=math_block["stem_latex"],
+                    options_latex=math_block["options_latex"],
+                    image_urls=math_block["image_urls"],
+                )
+            )
+    elif row:
+        db.delete(row)
+
+
+@app.post("/questions/upload-image")
+def upload_question_image(
+    file: UploadFile = File(...),
+    _: User = Depends(require_admin),
+):
+    ct = (file.content_type or "").split(";")[0].strip().lower()
+    ext = _ALLOWED_IMAGE_CT.get(ct)
+    if not ext:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "unsupported image type (use JPEG, PNG, WebP, or GIF)",
+        )
+    raw = file.file.read()
+    if len(raw) > _MAX_IMAGE_BYTES:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "file too large (max 2MB)")
+    name = f"{uuid.uuid4().hex}{ext}"
+    path = UPLOAD_ROOT / name
+    path.write_bytes(raw)
+    return {"url": f"/uploads/{name}"}
 
 
 @app.get("/questions")
 def list_questions(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     rows = (
         db.query(Question)
-        .options(joinedload(Question.subject))
+        .options(joinedload(Question.subject), joinedload(Question.math_content))
         .order_by(Question.created_at.desc())
         .all()
     )
     out = []
     for q in rows:
         sub = q.subject
+        sub_dict = {"id": sub.id, "name": sub.name} if sub else None
         out.append(
             {
                 "id": q.id,
@@ -510,10 +653,12 @@ def list_questions(db: Session = Depends(get_db), _: User = Depends(get_current_
                 "options": q.options,
                 "correct_answers": q.correct_answers,
                 "points": q.points,
+                **_question_tool_flags(q),
                 "created_by": q.created_by,
                 "created_at": q.created_at.isoformat() + "Z",
                 "updated_at": q.updated_at.isoformat() + "Z",
-                "subjects": {"id": sub.id, "name": sub.name} if sub else None,
+                "subjects": sub_dict,
+                "math": _math_public(q),
             }
         )
     return out
@@ -521,7 +666,7 @@ def list_questions(db: Session = Depends(get_db), _: User = Depends(get_current_
 
 @app.post("/questions")
 def create_question(body: QuestionCreate, db: Session = Depends(get_db), user: User = Depends(require_admin)):
-    text, qtype, sid, opts, ca, pts = validate_and_normalize_question(db, body)
+    text, qtype, sid, opts, ca, pts, math_block, shuf, calc, ptab = validate_and_normalize_question(db, body)
     q = Question(
         question_text=text,
         question_type=qtype,
@@ -529,13 +674,19 @@ def create_question(body: QuestionCreate, db: Session = Depends(get_db), user: U
         options=opts,
         correct_answers=ca,
         points=pts,
+        shuffle_answer_options=shuf,
+        show_calculator=calc,
+        show_periodic_table=ptab,
         created_by=user.id,
     )
     db.add(q)
+    db.flush()
+    _persist_question_math(db, q.id, math_block)
     db.commit()
     db.refresh(q)
-    db.refresh(q, ["subject"])
+    db.refresh(q, ["subject", "math_content"])
     sub = q.subject
+    sub_dict = {"id": sub.id, "name": sub.name} if sub else None
     return {
         "id": q.id,
         "subject_id": q.subject_id,
@@ -544,10 +695,12 @@ def create_question(body: QuestionCreate, db: Session = Depends(get_db), user: U
         "options": q.options,
         "correct_answers": q.correct_answers,
         "points": q.points,
+        **_question_tool_flags(q),
         "created_by": q.created_by,
         "created_at": q.created_at.isoformat() + "Z",
         "updated_at": q.updated_at.isoformat() + "Z",
-        "subjects": {"id": sub.id, "name": sub.name} if sub else None,
+        "subjects": sub_dict,
+        "math": _math_public(q),
     }
 
 
@@ -556,13 +709,17 @@ def update_question(question_id: str, body: QuestionCreate, db: Session = Depend
     q = db.get(Question, question_id)
     if not q:
         raise HTTPException(404, "Not found")
-    text, qtype, sid, opts, ca, pts = validate_and_normalize_question(db, body)
+    text, qtype, sid, opts, ca, pts, math_block, shuf, calc, ptab = validate_and_normalize_question(db, body)
     q.question_text = text
     q.question_type = qtype
     q.subject_id = sid
     q.options = opts
     q.correct_answers = ca
     q.points = pts
+    q.shuffle_answer_options = shuf
+    q.show_calculator = calc
+    q.show_periodic_table = ptab
+    _persist_question_math(db, q.id, math_block)
     db.commit()
     return {"ok": True}
 
@@ -594,7 +751,7 @@ def _serialize_test(t: Test, db: Session) -> dict:
         db.query(TestQuestion)
         .filter(TestQuestion.test_id == t.id)
         .order_by(TestQuestion.question_order)
-        .options(joinedload(TestQuestion.question))
+        .options(joinedload(TestQuestion.question).joinedload(Question.math_content))
         .all()
     )
     sub = db.get(Subject, t.subject_id) if t.subject_id else None
@@ -618,6 +775,8 @@ def _serialize_test(t: Test, db: Session) -> dict:
                         "id": tq.question.id,
                         "question_text": tq.question.question_text,
                         "points": tq.question.points,
+                        "math": _math_public(tq.question),
+                        **_question_tool_flags(tq.question),
                     }
                     if tq.question
                     else None
@@ -656,7 +815,7 @@ def get_test(test_id: str, db: Session = Depends(get_db), user: User = Depends(g
         db.query(TestQuestion)
         .filter(TestQuestion.test_id == t.id)
         .order_by(TestQuestion.question_order)
-        .options(joinedload(TestQuestion.question))
+        .options(joinedload(TestQuestion.question).joinedload(Question.math_content))
         .all()
     )
     sub = db.get(Subject, t.subject_id) if t.subject_id else None
@@ -683,6 +842,8 @@ def get_test(test_id: str, db: Session = Depends(get_db), user: User = Depends(g
                         "options": tq.question.options,
                         "correct_answers": tq.question.correct_answers,
                         "points": tq.question.points,
+                        "math": _math_public(tq.question),
+                        **_question_tool_flags(tq.question),
                     }
                     if tq.question
                     else None
@@ -923,7 +1084,7 @@ def get_submission(submission_id: str, db: Session = Depends(get_db), user: User
         db.query(TestQuestion)
         .filter(TestQuestion.test_id == t.id)
         .order_by(TestQuestion.question_order)
-        .options(joinedload(TestQuestion.question))
+        .options(joinedload(TestQuestion.question).joinedload(Question.math_content))
         .all()
     )
     student = db.get(User, s.student_id)
@@ -963,6 +1124,8 @@ def get_submission(submission_id: str, db: Session = Depends(get_db), user: User
                             "created_by": tq.question.created_by,
                             "created_at": tq.question.created_at.isoformat() + "Z",
                             "updated_at": tq.question.updated_at.isoformat() + "Z",
+                            "math": _math_public(tq.question),
+                            **_question_tool_flags(tq.question),
                         }
                         if tq.question
                         else None

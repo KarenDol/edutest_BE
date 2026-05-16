@@ -52,11 +52,41 @@ class Question(Base):
     options: Mapped[list] = mapped_column(JSON, default=list)
     correct_answers: Mapped[list] = mapped_column(JSON, default=list)
     points: Mapped[int] = mapped_column(Integer, default=1)
+    shuffle_answer_options: Mapped[bool] = mapped_column(Boolean, default=False)
+    show_calculator: Mapped[bool] = mapped_column(Boolean, default=False)
+    show_periodic_table: Mapped[bool] = mapped_column(Boolean, default=False)
     created_by: Mapped[str | None] = mapped_column(String(36), ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     subject = relationship("Subject", foreign_keys=[subject_id])
+    math_content = relationship(
+        "QuestionMath",
+        back_populates="question",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+
+class QuestionMath(Base):
+    """LaTeX (MathLive) stem/options and figure URLs; canonical math payload separate from questions row."""
+
+    __tablename__ = "question_math"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    question_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("questions.id", ondelete="CASCADE"),
+        unique=True,
+        index=True,
+    )
+    stem_latex: Mapped[str] = mapped_column(Text)
+    options_latex: Mapped[list] = mapped_column(JSON, default=list)
+    image_urls: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    question = relationship("Question", back_populates="math_content")
 
 
 class Test(Base):

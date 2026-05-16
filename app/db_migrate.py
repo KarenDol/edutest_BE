@@ -79,3 +79,20 @@ def migrate_users(engine) -> None:
             if dirty:
                 db.add(u)
         db.commit()
+
+
+def migrate_questions(engine) -> None:
+    """SQLite: add question helper columns if missing. Other DBs: rely on schema deploy / create on fresh DB."""
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(questions)")).fetchall()
+        cols = {r[1] for r in rows}
+        statements = [
+            ("shuffle_answer_options", "ALTER TABLE questions ADD COLUMN shuffle_answer_options BOOLEAN DEFAULT 0"),
+            ("show_calculator", "ALTER TABLE questions ADD COLUMN show_calculator BOOLEAN DEFAULT 0"),
+            ("show_periodic_table", "ALTER TABLE questions ADD COLUMN show_periodic_table BOOLEAN DEFAULT 0"),
+        ]
+        for col, stmt in statements:
+            if col not in cols:
+                conn.execute(text(stmt))
