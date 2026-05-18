@@ -2,14 +2,21 @@ import hashlib
 import logging
 import secrets
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
+import asyncio
+import json
+import os
+import tempfile
+
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import func
@@ -17,7 +24,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
 from app.database import Base, engine, get_db
-from app.db_migrate import migrate_questions, migrate_users
+from app.db_migrate import migrate_question_reports, migrate_questions, migrate_users
 from app.deps import get_current_user, require_admin
 from app.email_smtp import (
     _smtp_configured,
@@ -25,7 +32,17 @@ from app.email_smtp import (
     notify_admins_new_student,
     notify_student_email_verification,
 )
-from app.models import Question, QuestionMath, Subject, Submission, Test, TestQuestion, User
+from app.models import (
+    Question,
+    QuestionMath,
+    QuestionReport,
+    Subject,
+    Submission,
+    Test,
+    TestQuestion,
+    User,
+)
+from app.pdf_import.service import stream_parsed_questions
 from app.security import (
     ACCESS_TOKEN_EXPIRE_DAYS,
     ACCESS_TOKEN_REMEMBER_DAYS,
@@ -51,6 +68,7 @@ async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
     migrate_users(engine)
     migrate_questions(engine)
+    migrate_question_reports(engine)
     log_email_startup_hints(settings)
     _log.info(
         "Student sign-up requires working SMTP and PUBLIC_APP_BASE_URL; each new student gets a verification email "
@@ -734,6 +752,194 @@ def delete_question(question_id: str, db: Session = Depends(get_db), _: User = D
     return {"ok": True}
 
 
+# --- PDF import ---
+
+
+class ImportQuestionItem(BaseModel):
+    question_text: str = ""
+    options: list[str] = Field(default_factory=list)
+    correct_answers: list[int] = Field(default_factory=list)
+    question_type: str = "single_choice"
+    points: int = Field(default=1, ge=1)
+    use_math: bool = False
+
+
+def _sanitize_import_options(options: list[str]) -> list[str]:
+    return [str(o).strip() for o in options if str(o).strip()]
+
+
+def _validate_import_item_fields(item: ImportQuestionItem) -> tuple[str, list[str], list[int]]:
+    """Return normalized fields or raise HTTPException with a clear message."""
+    text = item.question_text.strip()
+    if not text:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "question_text is required")
+    opts = _sanitize_import_options(item.options)
+    if len(opts) < 2:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"at least two non-empty options are required (got {len(opts)})",
+        )
+    ca = item.correct_answers
+    if not ca:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "at least one correct answer is required")
+    if any(not isinstance(i, int) or i < 0 or i >= len(opts) for i in ca):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "correct_answers must be valid option indices",
+        )
+    qtype = item.question_type.strip()
+    if qtype == "single_choice" and len(ca) != 1:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "single_choice requires exactly one correct answer",
+        )
+    return text, opts, ca
+
+
+def _import_item_uses_math(item: ImportQuestionItem) -> bool:
+    if item.use_math:
+        return True
+    if "$" in item.question_text:
+        return True
+    return any("$" in o for o in item.options)
+
+
+def _question_create_from_import(
+    item: ImportQuestionItem,
+    subject_id: str,
+    *,
+    question_text: str,
+    options: list[str],
+    correct_answers: list[int],
+) -> QuestionCreate:
+    if _import_item_uses_math(item):
+        return QuestionCreate(
+            question_text=question_text,
+            question_type=item.question_type,
+            subject_id=subject_id,
+            options=options,
+            correct_answers=correct_answers,
+            points=item.points,
+            math=QuestionMathPayload(
+                stem_latex="",
+                options_latex=options,
+                image_urls=[],
+            ),
+        )
+    return QuestionCreate(
+        question_text=question_text,
+        question_type=item.question_type,
+        subject_id=subject_id,
+        options=options,
+        correct_answers=correct_answers,
+        points=item.points,
+    )
+
+
+class ImportBatchCreate(BaseModel):
+    subject_id: str
+    questions: list[ImportQuestionItem] = Field(min_length=1)
+
+
+@app.post("/questions/import-pdf")
+async def import_questions_from_pdf(
+    request: Request,
+    file: UploadFile = File(...),
+    _: User = Depends(require_admin),
+):
+    if not settings.openai_api_key:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "PDF import is not configured (set OPENAI_API_KEY)",
+        )
+    name = (file.filename or "").lower()
+    if not name.endswith((".pdf", ".xlsx")):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Unsupported file type (PDF or XLSX only)")
+
+    suffix = os.path.splitext(name)[1]
+    contents = await file.read()
+    if len(contents) > 25 * 1024 * 1024:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "File too large (max 25MB)")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(contents)
+        tmp_path = tmp.name
+
+    disconnected = asyncio.Event()
+
+    async def watch_disconnect() -> None:
+        while True:
+            if await request.is_disconnected():
+                disconnected.set()
+                return
+            await asyncio.sleep(0.5)
+
+    disconnect_task = asyncio.create_task(watch_disconnect())
+
+    async def body() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in stream_parsed_questions(tmp_path, disconnected=disconnected):
+                yield chunk
+        except json.JSONDecodeError as e:
+            yield (json.dumps({"type": "error", "message": f"Invalid AI response: {e}"}) + "\n").encode(
+                "utf-8"
+            )
+        except Exception as e:
+            _log.exception("PDF import failed")
+            yield (json.dumps({"type": "error", "message": str(e)}) + "\n").encode("utf-8")
+        finally:
+            disconnect_task.cancel()
+
+    return StreamingResponse(body(), media_type="application/jsonl; charset=utf-8")
+
+
+@app.post("/questions/import-batch")
+def import_questions_batch(
+    body: ImportBatchCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_admin),
+):
+    created: list[dict] = []
+    errors: list[dict] = []
+
+    for i, item in enumerate(body.questions):
+        try:
+            q_text, q_opts, q_ca = _validate_import_item_fields(item)
+            q_body = _question_create_from_import(
+                item,
+                body.subject_id,
+                question_text=q_text,
+                options=q_opts,
+                correct_answers=q_ca,
+            )
+            text, qtype, sid, opts, ca, pts, math_block, shuf, calc, ptab = validate_and_normalize_question(
+                db, q_body
+            )
+            q = Question(
+                question_text=text,
+                question_type=qtype,
+                subject_id=sid,
+                options=opts,
+                correct_answers=ca,
+                points=pts,
+                shuffle_answer_options=shuf,
+                show_calculator=calc,
+                show_periodic_table=ptab,
+                created_by=user.id,
+            )
+            db.add(q)
+            db.flush()
+            _persist_question_math(db, q.id, math_block)
+            created.append({"index": i, "id": q.id})
+        except HTTPException as e:
+            errors.append({"index": i, "detail": e.detail})
+        except Exception as e:
+            errors.append({"index": i, "detail": str(e)})
+
+    db.commit()
+    return {"created": created, "errors": errors, "created_count": len(created)}
+
+
 # --- Tests ---
 
 
@@ -949,6 +1155,55 @@ def delete_test(test_id: str, db: Session = Depends(get_db), _: User = Depends(r
 
 # --- Submissions ---
 
+QUESTION_REPORT_REASONS = frozenset(
+    {
+        "no_correct_option",
+        "mistake_in_question",
+        "wrong_correct_answer",
+        "unclear_wording",
+        "other",
+    }
+)
+
+
+def _serialize_question_report(r: QuestionReport) -> dict:
+    return {
+        "id": r.id,
+        "submission_id": r.submission_id,
+        "question_id": r.question_id,
+        "reason": r.reason,
+        "comment": r.comment,
+        "created_at": r.created_at.isoformat() + "Z",
+    }
+
+
+class QuestionReportCreate(BaseModel):
+    question_id: str
+    reason: str
+    comment: str | None = None
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, v: str) -> str:
+        key = v.strip()
+        if key not in QUESTION_REPORT_REASONS:
+            raise ValueError(
+                f"reason must be one of: {', '.join(sorted(QUESTION_REPORT_REASONS))}"
+            )
+        return key
+
+    @field_validator("comment")
+    @classmethod
+    def validate_comment(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        s = v.strip()
+        if not s:
+            return None
+        if len(s) > 2000:
+            raise ValueError("comment too long (max 2000 characters)")
+        return s
+
 
 class SubmissionCreate(BaseModel):
     test_id: str
@@ -1088,6 +1343,12 @@ def get_submission(submission_id: str, db: Session = Depends(get_db), user: User
         .all()
     )
     student = db.get(User, s.student_id)
+    reports = (
+        db.query(QuestionReport)
+        .filter(QuestionReport.submission_id == s.id)
+        .order_by(QuestionReport.created_at.desc())
+        .all()
+    )
     return {
         "id": s.id,
         "student_id": s.student_id,
@@ -1099,6 +1360,7 @@ def get_submission(submission_id: str, db: Session = Depends(get_db), user: User
         "started_at": s.started_at.isoformat() + "Z",
         "submitted_at": s.submitted_at.isoformat() + "Z" if s.submitted_at else None,
         "profiles": {"name": student.name, "email": student.email} if student else None,
+        "question_reports": [_serialize_question_report(r) for r in reports],
         "tests": {
             "id": t.id,
             "title": t.title,
@@ -1193,6 +1455,100 @@ def patch_submission(
         s.submitted_at = datetime.fromisoformat(raw).replace(tzinfo=None)
     db.commit()
     return {"ok": True}
+
+
+@app.post("/submissions/{submission_id}/question-reports")
+def create_question_report(
+    submission_id: str,
+    body: QuestionReportCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if user.role != "student":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Students only")
+    if body.reason == "other" and not body.comment:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "comment is required when reason is 'other'",
+        )
+
+    s = db.get(Submission, submission_id)
+    if not s or s.student_id != user.id:
+        raise HTTPException(404, "Not found")
+    if not s.submitted_at:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "You can report a question only after submitting the test",
+        )
+
+    in_test = (
+        db.query(TestQuestion.id)
+        .filter(
+            TestQuestion.test_id == s.test_id,
+            TestQuestion.question_id == body.question_id,
+        )
+        .first()
+    )
+    if not in_test:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "question is not part of this test")
+
+    existing = (
+        db.query(QuestionReport)
+        .filter(
+            QuestionReport.submission_id == s.id,
+            QuestionReport.question_id == body.question_id,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "You already reported this question for this attempt",
+        )
+
+    row = QuestionReport(
+        submission_id=s.id,
+        question_id=body.question_id,
+        reporter_id=user.id,
+        reason=body.reason,
+        comment=body.comment,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return _serialize_question_report(row)
+
+
+@app.get("/question-reports")
+def list_question_reports(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    rows = (
+        db.query(QuestionReport)
+        .order_by(QuestionReport.created_at.desc())
+        .limit(200)
+        .all()
+    )
+    out = []
+    for r in rows:
+        sub = db.get(Submission, r.submission_id)
+        test = db.get(Test, sub.test_id) if sub else None
+        reporter = db.get(User, r.reporter_id)
+        question = db.get(Question, r.question_id)
+        out.append(
+            {
+                **_serialize_question_report(r),
+                "reporter": {
+                    "name": reporter.name if reporter else None,
+                    "email": reporter.email if reporter else None,
+                },
+                "test": {"id": test.id, "title": test.title} if test else None,
+                "submission_id": r.submission_id,
+                "question_preview": (question.question_text[:200] if question else None),
+            }
+        )
+    return out
 
 
 # --- Dashboard aggregates ---

@@ -50,6 +50,33 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("PUBLIC_APP_BASE_URL", "APP_PUBLIC_URL"),
     )
 
+    openai_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("OPENAI_API_KEY"),
+    )
+    openai_model: str = Field(
+        default="gpt-4o",
+        validation_alias=AliasChoices("OPENAI_MODEL"),
+    )
+    openai_vision_model: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("OPENAI_VISION_MODEL"),
+        description="Model for PDF page images (defaults to OPENAI_MODEL). Use a vision-capable model.",
+    )
+    pdf_import_page_dpi: int = Field(
+        default=200,
+        validation_alias=AliasChoices("PDF_IMPORT_PAGE_DPI"),
+    )
+
+    @property
+    def openai_vision_model_effective(self) -> str:
+        """Vision model for PDF page images; falls back to OPENAI_MODEL then gpt-4o."""
+        explicit = (self.openai_vision_model or "").strip()
+        if explicit:
+            return explicit
+        base = (self.openai_model or "").strip()
+        return base if base else "gpt-4o"
+
     @property
     def email_approval_notify_recipients(self) -> list[str]:
         if not self.email_approval_notify_to:

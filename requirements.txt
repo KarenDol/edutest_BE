@@ -9,3 +9,7 @@ pydantic-settings==2.6.1
 email-validator==2.2.0
 python-multipart==0.0.17
 google-auth==2.36.0
+openai>=1.55.0
+pypdf>=5.1.0
+openpyxl>=3.1.5
+pymupdf>=1.24.0

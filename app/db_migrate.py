@@ -96,3 +96,48 @@ def migrate_questions(engine) -> None:
         for col, stmt in statements:
             if col not in cols:
                 conn.execute(text(stmt))
+
+
+def migrate_question_reports(engine) -> None:
+    """Ensure question_reports table exists (SQLite dev DBs created before the model)."""
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as conn:
+        tables = {
+            r[0]
+            for r in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            ).fetchall()
+        }
+        if "question_reports" in tables:
+            return
+        conn.execute(
+            text(
+                """
+                CREATE TABLE question_reports (
+                    id VARCHAR(36) PRIMARY KEY,
+                    submission_id VARCHAR(36) NOT NULL,
+                    question_id VARCHAR(36) NOT NULL,
+                    reporter_id VARCHAR(36) NOT NULL,
+                    reason VARCHAR(64) NOT NULL,
+                    comment TEXT,
+                    created_at DATETIME NOT NULL,
+                    FOREIGN KEY(submission_id) REFERENCES submissions(id) ON DELETE CASCADE,
+                    FOREIGN KEY(question_id) REFERENCES questions(id) ON DELETE CASCADE,
+                    FOREIGN KEY(reporter_id) REFERENCES users(id) ON DELETE CASCADE
+                )
+                """
+            )
+        )
+        conn.execute(
+            text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_question_report_per_submission "
+                "ON question_reports (submission_id, question_id)"
+            )
+        )
+        conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_question_reports_submission_id ON question_reports (submission_id)")
+        )
+        conn.execute(
+            text("CREATE INDEX IF NOT EXISTS ix_question_reports_question_id ON question_reports (question_id)")
+        )

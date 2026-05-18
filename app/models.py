@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, JSON
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, JSON, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -133,3 +133,28 @@ class Submission(Base):
 
     student = relationship("User", foreign_keys=[student_id])
     test = relationship("Test", foreign_keys=[test_id])
+
+
+class QuestionReport(Base):
+    """Student-reported issue with a question while reviewing a submitted test."""
+
+    __tablename__ = "question_reports"
+    __table_args__ = (
+        UniqueConstraint("submission_id", "question_id", name="uq_question_report_per_submission"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    submission_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("submissions.id", ondelete="CASCADE"), index=True
+    )
+    question_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("questions.id", ondelete="CASCADE"), index=True
+    )
+    reporter_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id", ondelete="CASCADE"))
+    reason: Mapped[str] = mapped_column(String(64))
+    comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    submission = relationship("Submission", foreign_keys=[submission_id])
+    question = relationship("Question", foreign_keys=[question_id])
+    reporter = relationship("User", foreign_keys=[reporter_id])
