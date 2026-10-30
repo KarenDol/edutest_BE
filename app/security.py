@@ -27,7 +27,7 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 def create_access_token(
     user_id: str,
-    email: str,
+    email: str | None,
     role: str,
     name: str | None,
     *,
@@ -37,7 +37,7 @@ def create_access_token(
     expire = datetime.now(timezone.utc) + timedelta(days=days)
     payload = {
         "sub": user_id,
-        "email": email,
+        "email": email or "",
         "role": role,
         "name": name or "",
         "exp": expire,

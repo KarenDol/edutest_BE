@@ -1,11 +1,13 @@
 import hashlib
 import logging
+import random
 import secrets
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 from urllib.parse import quote
 
@@ -18,13 +20,24 @@ from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, 
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import AliasChoices, BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from app.config import settings
 from app.database import Base, engine, get_db
-from app.db_migrate import migrate_question_reports, migrate_questions, migrate_users
+from app.db_migrate import (
+    migrate_question_reports,
+    migrate_questions,
+    migrate_test_sections,
+    migrate_tests,
+    migrate_users,
+    migrate_proctoring,
+)
+from app.explain_answer import explain_question, normalize_explain_locale
+from app.question_difficulty import QUESTION_DIFFICULTY_DEFAULT, normalize_question_difficulty
+from app.text_breaks import restore_literal_newlines
+from app.question_languages import QUESTION_LANGUAGE_DEFAULT, normalize_question_language
 from app.deps import get_current_user, require_admin
 from app.email_smtp import (
     _smtp_configured,
@@ -32,14 +45,20 @@ from app.email_smtp import (
     notify_admins_new_student,
     notify_student_email_verification,
 )
+from app import telegram_gateway
 from app.models import (
+    ProctoringChunk,
+    ProctoringDetectionLog,
+    ProctoringReport,
     Question,
     QuestionMath,
     QuestionReport,
+    PhoneVerification,
     Subject,
     Submission,
     Test,
     TestQuestion,
+    TestSection,
     User,
 )
 from app.pdf_import.service import stream_parsed_questions
@@ -68,11 +87,14 @@ async def lifespan(_: FastAPI):
     Base.metadata.create_all(bind=engine)
     migrate_users(engine)
     migrate_questions(engine)
+    migrate_tests(engine)
+    migrate_test_sections(engine)
     migrate_question_reports(engine)
+    migrate_proctoring(engine)
     log_email_startup_hints(settings)
     _log.info(
-        "Student sign-up requires working SMTP and PUBLIC_APP_BASE_URL; each new student gets a verification email "
-        "and cannot log in until they confirm. (No administrator approval.)"
+        "Student sign-up verifies the phone number with a Telegram code (TELEGRAM_GATEWAY_TOKEN). "
+        "(No administrator approval.)"
     )
     with Session(engine) as db:
         if db.query(User).count() == 0 and settings.seed_admin_email and settings.seed_admin_password:
@@ -108,12 +130,175 @@ app.add_middleware(
 UPLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=str(UPLOAD_ROOT)), name="uploads")
 
+from app.proctoring import router as proctoring_router  # noqa: E402
+
+app.include_router(proctoring_router)
+
+from app.whatsapp_webhook import router as whatsapp_router  # noqa: E402
+
+app.include_router(whatsapp_router)
+
 
 # --- Auth ---
 
+PHONE_CODE_TTL_SECONDS = 300
+PHONE_CODE_RESEND_SECONDS = 60
+PHONE_CODE_MAX_PER_PHONE_HOUR = 5
+PHONE_CODE_MAX_PER_IP_HOUR = 20
+PHONE_CODE_MAX_ATTEMPTS = 5
+PHONE_TOKEN_TTL_MINUTES = 30
+
+
+class PhoneCodeSendBody(BaseModel):
+    phone: str = Field(min_length=5, max_length=32)
+    purpose: Literal["register", "reset"]
+
+
+class PhoneCodeSendResponse(BaseModel):
+    verification_id: str
+    phone: str
+    expires_in: int
+    resend_in: int
+
+
+class PhoneCodeVerifyBody(BaseModel):
+    verification_id: str = Field(min_length=1, max_length=36)
+    code: str = Field(pattern=r"^\d{4,8}$")
+
+
+class PhoneCodeVerifyResponse(BaseModel):
+    verification_token: str
+    phone: str
+
+
+@app.post("/auth/phone/send-code", response_model=PhoneCodeSendResponse)
+def send_phone_code(body: PhoneCodeSendBody, request: Request, db: Session = Depends(get_db)):
+    """Send a Telegram verification code for sign-up or password reset."""
+    if not telegram_gateway.is_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Phone verification is not configured (set TELEGRAM_GATEWAY_TOKEN on the API).",
+        )
+    phone = telegram_gateway.normalize_phone(body.phone)
+    if not phone:
+        raise HTTPException(status_code=400, detail="Invalid phone number")
+    registered = db.query(User).filter(User.phone == phone).first() is not None
+    if body.purpose == "register" and registered:
+        raise HTTPException(status_code=400, detail="Phone already registered")
+    if body.purpose == "reset" and not registered:
+        raise HTTPException(status_code=404, detail="No account with this phone number")
+
+    now = datetime.utcnow()
+    hour_ago = now - timedelta(hours=1)
+    last = (
+        db.query(PhoneVerification)
+        .filter(PhoneVerification.phone == phone)
+        .order_by(PhoneVerification.created_at.desc())
+        .first()
+    )
+    if last and (now - last.created_at).total_seconds() < PHONE_CODE_RESEND_SECONDS:
+        wait = PHONE_CODE_RESEND_SECONDS - int((now - last.created_at).total_seconds())
+        raise HTTPException(status_code=429, detail=f"Please wait {wait} seconds before requesting a new code.")
+    sent_to_phone = (
+        db.query(PhoneVerification)
+        .filter(PhoneVerification.phone == phone, PhoneVerification.created_at > hour_ago)
+        .count()
+    )
+    client_ip = request.client.host if request.client else None
+    sent_from_ip = (
+        db.query(PhoneVerification)
+        .filter(PhoneVerification.client_ip == client_ip, PhoneVerification.created_at > hour_ago)
+        .count()
+        if client_ip
+        else 0
+    )
+    if sent_to_phone >= PHONE_CODE_MAX_PER_PHONE_HOUR or sent_from_ip >= PHONE_CODE_MAX_PER_IP_HOUR:
+        raise HTTPException(status_code=429, detail="Too many codes requested. Try again later.")
+
+    try:
+        result = telegram_gateway.send_verification_message(phone, ttl=PHONE_CODE_TTL_SECONDS)
+    except telegram_gateway.GatewayError as e:
+        if e.code.startswith("PHONE_NUMBER"):
+            raise HTTPException(
+                status_code=400,
+                detail="Could not send a code to this number. Check the number and make sure it has a Telegram account.",
+            ) from None
+        raise HTTPException(
+            status_code=502, detail="Telegram verification is temporarily unavailable. Try again later."
+        ) from None
+
+    v = PhoneVerification(
+        phone=phone,
+        purpose=body.purpose,
+        request_id=str(result["request_id"]),
+        client_ip=client_ip,
+        expires_at=now + timedelta(seconds=PHONE_CODE_TTL_SECONDS),
+    )
+    db.add(v)
+    db.commit()
+    return PhoneCodeSendResponse(
+        verification_id=v.id,
+        phone=phone,
+        expires_in=PHONE_CODE_TTL_SECONDS,
+        resend_in=PHONE_CODE_RESEND_SECONDS,
+    )
+
+
+@app.post("/auth/phone/verify", response_model=PhoneCodeVerifyResponse)
+def verify_phone_code(body: PhoneCodeVerifyBody, db: Session = Depends(get_db)):
+    """Check the code with Telegram; on success return a one-time token for /auth/register or /auth/reset-password."""
+    v = db.get(PhoneVerification, body.verification_id)
+    if not v or v.verified_at is not None:
+        raise HTTPException(status_code=400, detail="Invalid or expired code. Request a new one.")
+    if datetime.utcnow() > v.expires_at or v.attempts >= PHONE_CODE_MAX_ATTEMPTS:
+        raise HTTPException(
+            status_code=400, detail="The code has expired or too many attempts were made. Request a new one."
+        )
+    v.attempts += 1
+    db.commit()
+    try:
+        result = telegram_gateway.check_verification_status(v.request_id, body.code)
+    except telegram_gateway.GatewayError:
+        raise HTTPException(
+            status_code=502, detail="Telegram verification is temporarily unavailable. Try again later."
+        ) from None
+    code_status = (result.get("verification_status") or {}).get("status")
+    if code_status == "code_invalid":
+        raise HTTPException(status_code=400, detail="Incorrect code")
+    if code_status != "code_valid":
+        v.attempts = PHONE_CODE_MAX_ATTEMPTS
+        db.commit()
+        raise HTTPException(
+            status_code=400, detail="The code has expired or too many attempts were made. Request a new one."
+        )
+
+    raw = secrets.token_urlsafe(32)
+    v.verified_at = datetime.utcnow()
+    v.token_hash = hashlib.sha256(raw.encode()).hexdigest()
+    v.token_expires_at = v.verified_at + timedelta(minutes=PHONE_TOKEN_TTL_MINUTES)
+    db.commit()
+    return PhoneCodeVerifyResponse(verification_token=raw, phone=v.phone)
+
+
+def _verified_phone(db: Session, verification_token: str, purpose: str) -> PhoneVerification:
+    h = hashlib.sha256(verification_token.encode()).hexdigest()
+    v = (
+        db.query(PhoneVerification)
+        .filter(PhoneVerification.token_hash == h, PhoneVerification.purpose == purpose)
+        .first()
+    )
+    if (
+        not v
+        or v.consumed_at is not None
+        or v.token_expires_at is None
+        or datetime.utcnow() > v.token_expires_at
+    ):
+        raise HTTPException(status_code=400, detail="Phone verification expired. Request a new code.")
+    return v
+
 
 class RegisterBody(BaseModel):
-    email: EmailStr
+    verification_token: str = Field(min_length=16)
     password: str = Field(min_length=6)
     last_name: str = Field(min_length=1, max_length=255)
     first_name: str = Field(min_length=1, max_length=255)
@@ -140,7 +325,8 @@ def _display_name(last: str, first: str, patronymic: str | None) -> str:
 
 
 class LoginBody(BaseModel):
-    email: EmailStr
+    # Phone for students; email still works for admins and accounts created before phone sign-up.
+    login: str = Field(min_length=1, max_length=255, validation_alias=AliasChoices("login", "phone", "email"))
     password: str
     remember_me: bool = False
 
@@ -167,6 +353,7 @@ class ProfileOut(BaseModel):
     id: str
     name: str | None
     email: str | None
+    phone: str | None
     role: str
     created_at: datetime
     updated_at: datetime
@@ -174,40 +361,18 @@ class ProfileOut(BaseModel):
 
 @app.post("/auth/register", response_model=RegisterResponse)
 def register(body: RegisterBody, db: Session = Depends(get_db)):
-    if db.query(User).filter(User.email == body.email).first():
-        raise HTTPException(status_code=400, detail="Email already registered")
+    v = _verified_phone(db, body.verification_token, "register")
+    if db.query(User).filter(User.phone == v.phone).first():
+        raise HTTPException(status_code=400, detail="Phone already registered")
     if body.iin == "000000000000":
         raise HTTPException(status_code=400, detail="Invalid IIN")
     if db.query(User).filter(User.iin == body.iin).first():
         raise HTTPException(status_code=400, detail="IIN already registered")
     display = _display_name(body.last_name, body.first_name, body.patronymic)
-    smtp_ok = _smtp_configured(settings)
-    pub_base = (settings.public_app_base_url or "").strip().rstrip("/")
-    if not smtp_ok:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Student registration requires email verification. On the API server, set SMTP in the "
-                "FastAPI app environment: SMTP_HOST, SMTP_FROM, and usually SMTP_USER / SMTP_PASSWORD "
-                "(see test_builder_BE/.env.example)."
-            ),
-        )
-    if not pub_base:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "Student registration requires email verification. On the API server, set PUBLIC_APP_BASE_URL "
-                "in the FastAPI app environment to your frontend URL (no trailing slash), e.g. https://app.example.com "
-                "(see test_builder_BE/.env.example)."
-            ),
-        )
-
-    raw_token = secrets.token_urlsafe(32)
-    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
-    expires_at = datetime.utcnow() + timedelta(hours=48)
 
     user = User(
-        email=body.email,
+        email=None,
+        phone=v.phone,
         password_hash=hash_password(body.password),
         name=display,
         last_name=body.last_name.strip(),
@@ -219,44 +384,54 @@ def register(body: RegisterBody, db: Session = Depends(get_db)):
         ent_profile=body.ent_profile,
         role="student",
         signup_approved=True,
-        email_verified=False,
-        email_verify_token_hash=token_hash,
-        email_verify_expires_at=expires_at,
+        email_verified=True,  # nothing to confirm: the phone was verified via Telegram
     )
+    v.consumed_at = datetime.utcnow()
     db.add(user)
     db.commit()
     db.refresh(user)
 
-    link = f"{pub_base}/ru/auth/verify-email?token={quote(raw_token, safe='')}"
-    sent = notify_student_email_verification(
-        settings,
-        student_email=body.email,
-        student_name=display,
-        verification_link=link,
-    )
-    if not sent:
-        db.delete(user)
-        db.commit()
-        raise HTTPException(
-            status_code=503,
-            detail="Could not send the verification email. Check SMTP settings and try again.",
-        )
-
     notify_admins_new_student(
         settings,
         student_name=display,
-        student_email=body.email,
+        student_phone=v.phone,
         user_id=user.id,
     )
 
-    return RegisterResponse(access_token=None, pending_email_verification=True)
+    token = create_access_token(user.id, user.email, user.role, user.name)
+    return RegisterResponse(access_token=token)
+
+
+class PasswordResetBody(BaseModel):
+    verification_token: str = Field(min_length=16)
+    password: str = Field(min_length=6)
+
+
+@app.post("/auth/reset-password")
+def reset_password(body: PasswordResetBody, db: Session = Depends(get_db)):
+    v = _verified_phone(db, body.verification_token, "reset")
+    user = db.query(User).filter(User.phone == v.phone).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="No account with this phone number")
+    user.password_hash = hash_password(body.password)
+    v.consumed_at = datetime.utcnow()
+    db.commit()
+    return {"ok": True}
+
+
+def _user_by_login(db: Session, login: str) -> User | None:
+    s = login.strip()
+    if "@" in s:
+        return db.query(User).filter(func.lower(User.email) == s.lower()).first()
+    phone = telegram_gateway.normalize_phone(s)
+    return db.query(User).filter(User.phone == phone).first() if phone else None
 
 
 @app.post("/auth/login", response_model=TokenResponse)
 def login(body: LoginBody, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == body.email).first()
+    user = _user_by_login(db, body.login)
     if not user or not verify_password(body.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        raise HTTPException(status_code=401, detail="Invalid phone number or password")
     if not user.email_verified:
         raise HTTPException(
             status_code=403,
@@ -379,6 +554,7 @@ def me(user: User = Depends(get_current_user)):
         id=user.id,
         name=user.name,
         email=user.email,
+        phone=user.phone,
         role=user.role,
         created_at=user.created_at,
         updated_at=user.updated_at,
@@ -387,7 +563,8 @@ def me(user: User = Depends(get_current_user)):
 
 class StudentListItem(BaseModel):
     id: str
-    email: str
+    email: str | None
+    phone: str | None
     name: str | None = None
     first_name: str | None = None
     last_name: str | None = None
@@ -409,6 +586,7 @@ def list_students(db: Session = Depends(get_db), _: User = Depends(require_admin
         StudentListItem(
             id=r.id,
             email=r.email,
+            phone=r.phone,
             name=r.name,
             first_name=r.first_name,
             last_name=r.last_name,
@@ -481,17 +659,38 @@ class QuestionMathPayload(BaseModel):
     image_urls: list[str] = Field(default_factory=list)
 
 
+class MatchOptionsPayload(BaseModel):
+    left: list[str] = Field(default_factory=list)
+    right: list[str] = Field(default_factory=list)
+
+
 class QuestionCreate(BaseModel):
     question_text: str = ""
     question_type: str
     subject_id: str
-    options: list[str] = Field(default_factory=list)
+    options: list[str] | MatchOptionsPayload = Field(default_factory=list)
     correct_answers: list[int]
     points: int = Field(default=1, ge=1)
+    language: str = Field(default=QUESTION_LANGUAGE_DEFAULT)
+    difficulty: str = Field(default=QUESTION_DIFFICULTY_DEFAULT)
     math: QuestionMathPayload | None = None
-    shuffle_answer_options: bool = False
-    show_calculator: bool = False
-    show_periodic_table: bool = False
+
+    @field_validator("options", mode="before")
+    @classmethod
+    def _coerce_options(cls, v: object) -> object:
+        if isinstance(v, dict) and ("left" in v or "right" in v):
+            return MatchOptionsPayload.model_validate(v)
+        return v
+
+    @field_validator("language")
+    @classmethod
+    def _validate_language(cls, v: str) -> str:
+        return normalize_question_language(v)
+
+    @field_validator("difficulty")
+    @classmethod
+    def _validate_difficulty(cls, v: str) -> str:
+        return normalize_question_difficulty(v)
 
 
 def _math_public(q: Question) -> dict | None:
@@ -505,12 +704,21 @@ def _math_public(q: Question) -> dict | None:
     }
 
 
-def _question_tool_flags(q: Question) -> dict:
+def _test_tool_flags(t: Test) -> dict:
     return {
-        "shuffle_answer_options": bool(q.shuffle_answer_options),
-        "show_calculator": bool(q.show_calculator),
-        "show_periodic_table": bool(q.show_periodic_table),
+        "shuffle_answer_options": bool(t.shuffle_answer_options),
+        "show_calculator": bool(t.show_calculator),
+        "show_periodic_table": bool(t.show_periodic_table),
+        "proctoring_version": int(getattr(t, "proctoring_version", 0) or 0),
     }
+
+
+def _question_language(q: Question) -> str:
+    return normalize_question_language(q.language)
+
+
+def _question_difficulty(q: Question) -> str:
+    return normalize_question_difficulty(getattr(q, "difficulty", None))
 
 
 def _validate_image_urls(urls: list[str]) -> list[str]:
@@ -532,15 +740,30 @@ def _validate_image_urls(urls: list[str]) -> list[str]:
     return out
 
 
+def _question_max_points(q: Question) -> int:
+    """Total points a question can award (match questions use points × section count)."""
+    if q.question_type == "match":
+        opts = q.options
+        n = 0
+        if isinstance(opts, dict):
+            left = opts.get("left")
+            if isinstance(left, list):
+                n = len(left)
+        if n == 0 and isinstance(q.correct_answers, list):
+            n = len(q.correct_answers)
+        return int(q.points or 0) * n
+    return int(q.points or 0)
+
+
 def validate_and_normalize_question(
     db: Session, body: QuestionCreate
-) -> tuple[str, str, str, list[str], list[int], int, dict | None, bool, bool, bool]:
-    """Return normalized question row fields, optional math payload, and UI tool flags."""
+) -> tuple[str, str, str, list[str] | dict, list[int], int, str, str, dict | None]:
+    """Return normalized question row fields and optional math payload."""
     qtype = body.question_type.strip()
-    if qtype not in ("single_choice", "multiple_choice"):
+    if qtype not in ("single_choice", "multiple_choice", "match"):
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            "question_type must be single_choice or multiple_choice",
+            "question_type must be single_choice, multiple_choice, or match",
         )
     sid = body.subject_id.strip()
     if not sid:
@@ -548,15 +771,70 @@ def validate_and_normalize_question(
     if not db.get(Subject, sid):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "subject not found")
 
+    if qtype == "match":
+        if body.math is not None:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "math mode is not supported for match questions",
+            )
+        text = restore_literal_newlines(body.question_text).strip()
+        if not text:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "question_text is required")
+        raw_opts = body.options
+        if isinstance(raw_opts, MatchOptionsPayload):
+            left_raw, right_raw = raw_opts.left, raw_opts.right
+        elif isinstance(raw_opts, dict):
+            left_raw = raw_opts.get("left") or []
+            right_raw = raw_opts.get("right") or []
+        else:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "match questions require options.left and options.right",
+            )
+        left = [restore_literal_newlines(str(o)).strip() for o in left_raw]
+        right = [restore_literal_newlines(str(o)).strip() for o in right_raw]
+        if len(left) < 1:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "at least one match prompt is required")
+        if len(right) < 2:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "at least two answer choices are required")
+        if any(not o for o in left) or any(not o for o in right):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "every match prompt and choice must be non-empty")
+        ca = body.correct_answers
+        if len(ca) != len(left):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "correct_answers must have one entry per match prompt",
+            )
+        if any(not isinstance(i, int) or i < 0 or i >= len(right) for i in ca):
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "correct_answers must be valid choice indices")
+        if len(set(ca)) != len(ca):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "each answer choice can map to at most one prompt",
+            )
+        language = normalize_question_language(body.language)
+        difficulty = normalize_question_difficulty(body.difficulty)
+        return (
+            text,
+            qtype,
+            sid,
+            {"left": left, "right": right},
+            ca,
+            body.points,
+            language,
+            difficulty,
+            None,
+        )
+
     math_block: dict | None = None
     if body.math is not None:
-        plain = body.question_text.strip()
+        plain = restore_literal_newlines(body.question_text).strip()
         if not plain:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
                 "question_text is required for math questions (paste calculator output inside $...$ as needed)",
             )
-        opts = [str(o).strip() for o in body.math.options_latex]
+        opts = [restore_literal_newlines(str(o)).strip() for o in body.math.options_latex]
         if len(opts) < 2:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "at least two math options are required")
         if any(not o for o in opts):
@@ -570,10 +848,10 @@ def validate_and_normalize_question(
             "image_urls": _validate_image_urls(list(body.math.image_urls or [])),
         }
     else:
-        text = body.question_text.strip()
+        text = restore_literal_newlines(body.question_text).strip()
         if not text:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "question_text is required")
-        opts_final = [str(o).strip() for o in body.options]
+        opts_final = [restore_literal_newlines(str(o)).strip() for o in body.options]
         if len(opts_final) < 2:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "at least two options are required")
         if any(not o for o in opts_final):
@@ -595,6 +873,8 @@ def validate_and_normalize_question(
             status.HTTP_400_BAD_REQUEST,
             "multiple_choice correct_answers must not contain duplicate indices",
         )
+    language = normalize_question_language(body.language)
+    difficulty = normalize_question_difficulty(body.difficulty)
     return (
         text,
         qtype,
@@ -602,10 +882,9 @@ def validate_and_normalize_question(
         opts_final,
         ca,
         body.points,
+        language,
+        difficulty,
         math_block,
-        body.shuffle_answer_options,
-        body.show_calculator,
-        body.show_periodic_table,
     )
 
 
@@ -671,7 +950,8 @@ def list_questions(db: Session = Depends(get_db), _: User = Depends(get_current_
                 "options": q.options,
                 "correct_answers": q.correct_answers,
                 "points": q.points,
-                **_question_tool_flags(q),
+                "language": _question_language(q),
+                "difficulty": _question_difficulty(q),
                 "created_by": q.created_by,
                 "created_at": q.created_at.isoformat() + "Z",
                 "updated_at": q.updated_at.isoformat() + "Z",
@@ -682,9 +962,19 @@ def list_questions(db: Session = Depends(get_db), _: User = Depends(get_current_
     return out
 
 
+@app.get("/questions/count-by-subject")
+def question_count_by_subject(db: Session = Depends(get_db), _: User = Depends(require_admin)):
+    rows = (
+        db.query(Question.subject_id, func.count(Question.id))
+        .group_by(Question.subject_id)
+        .all()
+    )
+    return {sid or "": cnt for sid, cnt in rows}
+
+
 @app.post("/questions")
 def create_question(body: QuestionCreate, db: Session = Depends(get_db), user: User = Depends(require_admin)):
-    text, qtype, sid, opts, ca, pts, math_block, shuf, calc, ptab = validate_and_normalize_question(db, body)
+    text, qtype, sid, opts, ca, pts, lang, difficulty, math_block = validate_and_normalize_question(db, body)
     q = Question(
         question_text=text,
         question_type=qtype,
@@ -692,9 +982,8 @@ def create_question(body: QuestionCreate, db: Session = Depends(get_db), user: U
         options=opts,
         correct_answers=ca,
         points=pts,
-        shuffle_answer_options=shuf,
-        show_calculator=calc,
-        show_periodic_table=ptab,
+        language=lang,
+        difficulty=difficulty,
         created_by=user.id,
     )
     db.add(q)
@@ -713,7 +1002,8 @@ def create_question(body: QuestionCreate, db: Session = Depends(get_db), user: U
         "options": q.options,
         "correct_answers": q.correct_answers,
         "points": q.points,
-        **_question_tool_flags(q),
+        "language": _question_language(q),
+        "difficulty": _question_difficulty(q),
         "created_by": q.created_by,
         "created_at": q.created_at.isoformat() + "Z",
         "updated_at": q.updated_at.isoformat() + "Z",
@@ -727,16 +1017,15 @@ def update_question(question_id: str, body: QuestionCreate, db: Session = Depend
     q = db.get(Question, question_id)
     if not q:
         raise HTTPException(404, "Not found")
-    text, qtype, sid, opts, ca, pts, math_block, shuf, calc, ptab = validate_and_normalize_question(db, body)
+    text, qtype, sid, opts, ca, pts, lang, difficulty, math_block = validate_and_normalize_question(db, body)
     q.question_text = text
     q.question_type = qtype
     q.subject_id = sid
     q.options = opts
     q.correct_answers = ca
     q.points = pts
-    q.shuffle_answer_options = shuf
-    q.show_calculator = calc
-    q.show_periodic_table = ptab
+    q.language = lang
+    q.difficulty = difficulty
     _persist_question_math(db, q.id, math_block)
     db.commit()
     return {"ok": True}
@@ -761,7 +1050,20 @@ class ImportQuestionItem(BaseModel):
     correct_answers: list[int] = Field(default_factory=list)
     question_type: str = "single_choice"
     points: int = Field(default=1, ge=1)
+    language: str = Field(default=QUESTION_LANGUAGE_DEFAULT)
+    difficulty: str = Field(default=QUESTION_DIFFICULTY_DEFAULT)
     use_math: bool = False
+    image_urls: list[str] = Field(default_factory=list)
+
+    @field_validator("language")
+    @classmethod
+    def _validate_import_language(cls, v: str) -> str:
+        return normalize_question_language(v)
+
+    @field_validator("difficulty")
+    @classmethod
+    def _validate_import_difficulty(cls, v: str) -> str:
+        return normalize_question_difficulty(v)
 
 
 def _sanitize_import_options(options: list[str]) -> list[str]:
@@ -812,7 +1114,10 @@ def _question_create_from_import(
     options: list[str],
     correct_answers: list[int],
 ) -> QuestionCreate:
-    if _import_item_uses_math(item):
+    lang = normalize_question_language(item.language)
+    difficulty = normalize_question_difficulty(item.difficulty)
+    image_urls = list(item.image_urls or [])
+    if _import_item_uses_math(item) or image_urls:
         return QuestionCreate(
             question_text=question_text,
             question_type=item.question_type,
@@ -820,10 +1125,12 @@ def _question_create_from_import(
             options=options,
             correct_answers=correct_answers,
             points=item.points,
+            language=lang,
+            difficulty=difficulty,
             math=QuestionMathPayload(
                 stem_latex="",
                 options_latex=options,
-                image_urls=[],
+                image_urls=image_urls,
             ),
         )
     return QuestionCreate(
@@ -833,6 +1140,8 @@ def _question_create_from_import(
         options=options,
         correct_answers=correct_answers,
         points=item.points,
+        language=lang,
+        difficulty=difficulty,
     )
 
 
@@ -912,9 +1221,7 @@ def import_questions_batch(
                 options=q_opts,
                 correct_answers=q_ca,
             )
-            text, qtype, sid, opts, ca, pts, math_block, shuf, calc, ptab = validate_and_normalize_question(
-                db, q_body
-            )
+            text, qtype, sid, opts, ca, pts, lang, difficulty, math_block = validate_and_normalize_question(db, q_body)
             q = Question(
                 question_text=text,
                 question_type=qtype,
@@ -922,9 +1229,8 @@ def import_questions_batch(
                 options=opts,
                 correct_answers=ca,
                 points=pts,
-                shuffle_answer_options=shuf,
-                show_calculator=calc,
-                show_periodic_table=ptab,
+                language=lang,
+                difficulty=difficulty,
                 created_by=user.id,
             )
             db.add(q)
@@ -943,13 +1249,232 @@ def import_questions_batch(
 # --- Tests ---
 
 
+class SubjectPickInput(BaseModel):
+    subject_id: str
+    question_count: int = Field(ge=1, le=500)
+
+
+class TestSectionInput(BaseModel):
+    name: str
+    duration_minutes: int = Field(ge=1, le=600)
+    subject_picks: list[SubjectPickInput] = Field(default_factory=list)
+    question_ids: list[str] | None = None
+
+
 class TestCreate(BaseModel):
     title: str
     description: str | None = None
     subject_id: str | None = None
-    duration_minutes: int = 60
+    duration_minutes: int | None = None
     is_active: bool = False
-    question_ids: list[str]
+    shuffle_answer_options: bool = False
+    show_calculator: bool = False
+    show_periodic_table: bool = False
+    proctoring_version: int = 0
+    question_ids: list[str] | None = None
+    sections: list[TestSectionInput] | None = None
+    regenerate_questions: bool = False
+    test_count: int = Field(default=1, ge=1, le=50)
+
+
+def _serialize_test_section(sec: TestSection) -> dict:
+    return {
+        "id": sec.id,
+        "test_id": sec.test_id,
+        "name": sec.name,
+        "duration_minutes": sec.duration_minutes,
+        "section_order": sec.section_order,
+        "subject_picks": sec.subject_picks or [],
+    }
+
+
+def _pick_random_question_ids(
+    db: Session,
+    subject_picks: list[SubjectPickInput],
+    exclude_ids: set[str],
+) -> list[str]:
+    picked: list[str] = []
+    for pick in subject_picks:
+        pool = (
+            db.query(Question.id)
+            .filter(Question.subject_id == pick.subject_id)
+            .all()
+        )
+        available = [row[0] for row in pool if row[0] not in exclude_ids]
+        if len(available) < pick.question_count:
+            sub = db.get(Subject, pick.subject_id)
+            sub_name = sub.name if sub else pick.subject_id
+            raise HTTPException(
+                400,
+                detail=(
+                    f"Not enough questions for subject «{sub_name}»: "
+                    f"need {pick.question_count}, available {len(available)}"
+                ),
+            )
+        sample = random.sample(available, pick.question_count)
+        for qid in sample:
+            exclude_ids.add(qid)
+            picked.append(qid)
+    return picked
+
+
+def _subject_picks_key(picks: list) -> tuple:
+    return tuple(sorted((p["subject_id"], p["question_count"]) for p in picks))
+
+
+def _section_config_key(sec_in: TestSectionInput) -> tuple:
+    if sec_in.question_ids:
+        return ("manual", tuple(sec_in.question_ids))
+    return ("random", _subject_picks_key([p.model_dump() for p in sec_in.subject_picks]))
+
+
+def _resolve_section_question_ids(
+    db: Session, sec_in: TestSectionInput, exclude_ids: set[str]
+) -> list[str]:
+    if sec_in.question_ids:
+        if sec_in.subject_picks:
+            raise HTTPException(
+                400,
+                detail="Section cannot combine random subject picks with manual question_ids",
+            )
+        qids = list(sec_in.question_ids)
+        if len(qids) < 1:
+            raise HTTPException(400, detail="Each section must include at least one question")
+        seen: set[str] = set()
+        for qid in qids:
+            if qid in seen:
+                raise HTTPException(400, detail="Duplicate question in the same section")
+            seen.add(qid)
+            if qid in exclude_ids:
+                raise HTTPException(400, detail="The same question cannot appear in multiple sections")
+            if not db.get(Question, qid):
+                raise HTTPException(404, detail=f"Question not found: {qid}")
+        exclude_ids.update(qids)
+        return qids
+    if not sec_in.subject_picks:
+        raise HTTPException(
+            400,
+            detail="Each section needs subject_picks (random) or question_ids (manual)",
+        )
+    return _pick_random_question_ids(db, sec_in.subject_picks, exclude_ids)
+
+
+def _update_sections_metadata(db: Session, test: Test, sections: list[TestSectionInput]) -> None:
+    existing = (
+        db.query(TestSection)
+        .filter(TestSection.test_id == test.id)
+        .order_by(TestSection.section_order)
+        .all()
+    )
+    if len(existing) != len(sections):
+        raise HTTPException(
+            400,
+            detail="Section count changed. Enable «пересобрать вопросы» to apply new structure.",
+        )
+    total_duration = 0
+    for ex, sec_in in zip(existing, sections):
+        ex_key: tuple
+        if ex.subject_picks:
+            ex_key = ("random", _subject_picks_key(ex.subject_picks or []))
+        else:
+            ex_qids = [
+                tq.question_id
+                for tq in db.query(TestQuestion)
+                .filter(TestQuestion.section_id == ex.id)
+                .order_by(TestQuestion.question_order)
+                .all()
+            ]
+            ex_key = ("manual", tuple(ex_qids))
+        if ex_key != _section_config_key(sec_in):
+            raise HTTPException(
+                400,
+                detail="Section questions changed. Enable «пересобрать вопросы» to apply.",
+            )
+        ex.name = sec_in.name.strip()
+        ex.duration_minutes = sec_in.duration_minutes
+        total_duration += sec_in.duration_minutes
+    test.duration_minutes = total_duration
+
+
+def _required_questions_per_subject(sections: list[TestSectionInput]) -> dict[str, int]:
+    req: dict[str, int] = {}
+    for sec in sections:
+        for pick in sec.subject_picks:
+            req[pick.subject_id] = req.get(pick.subject_id, 0) + pick.question_count
+    return req
+
+
+def _validate_batch_questions_available(
+    db: Session,
+    sections: list[TestSectionInput],
+    test_count: int,
+) -> None:
+    per_test = _required_questions_per_subject(sections)
+    for sid, count_per_test in per_test.items():
+        needed = count_per_test * test_count
+        available = db.query(Question.id).filter(Question.subject_id == sid).count()
+        if available < needed:
+            sub = db.get(Subject, sid)
+            sub_name = sub.name if sub else sid
+            raise HTTPException(
+                400,
+                detail=(
+                    f"Not enough unique questions for subject «{sub_name}»: "
+                    f"need {needed} for {test_count} tests ({count_per_test} per test), "
+                    f"available {available}"
+                ),
+            )
+
+
+def _apply_test_sections(
+    db: Session,
+    test: Test,
+    sections: list[TestSectionInput],
+    exclude: set[str] | None = None,
+) -> None:
+    db.query(TestQuestion).filter(TestQuestion.test_id == test.id).delete()
+    db.query(TestSection).filter(TestSection.test_id == test.id).delete()
+    used = exclude if exclude is not None else set()
+    order = 0
+    total_duration = 0
+    for sec_idx, sec_in in enumerate(sections):
+        name = sec_in.name.strip()
+        if not name:
+            raise HTTPException(400, detail="Section name is required")
+        sec = TestSection(
+            test_id=test.id,
+            name=name,
+            duration_minutes=sec_in.duration_minutes,
+            section_order=sec_idx,
+            subject_picks=[],
+        )
+        db.add(sec)
+        db.flush()
+        total_duration += sec_in.duration_minutes
+        if sec_in.question_ids:
+            sec.subject_picks = []
+        else:
+            sec.subject_picks = [p.model_dump() for p in sec_in.subject_picks]
+        qids = _resolve_section_question_ids(db, sec_in, used)
+        for qid in qids:
+            db.add(
+                TestQuestion(
+                    test_id=test.id,
+                    section_id=sec.id,
+                    question_id=qid,
+                    question_order=order,
+                )
+            )
+            order += 1
+    test.duration_minutes = total_duration
+    test.subject_id = None
+
+
+def _apply_manual_questions(db: Session, test: Test, question_ids: list[str]) -> None:
+    db.query(TestQuestion).filter(TestQuestion.test_id == test.id).delete()
+    db.query(TestSection).filter(TestSection.test_id == test.id).delete()
+    for i, qid in enumerate(question_ids):
+        db.add(TestQuestion(test_id=test.id, question_id=qid, question_order=i))
 
 
 def _serialize_test(t: Test, db: Session) -> dict:
@@ -960,6 +1485,12 @@ def _serialize_test(t: Test, db: Session) -> dict:
         .options(joinedload(TestQuestion.question).joinedload(Question.math_content))
         .all()
     )
+    secs = (
+        db.query(TestSection)
+        .filter(TestSection.test_id == t.id)
+        .order_by(TestSection.section_order)
+        .all()
+    )
     sub = db.get(Subject, t.subject_id) if t.subject_id else None
     return {
         "id": t.id,
@@ -968,21 +1499,26 @@ def _serialize_test(t: Test, db: Session) -> dict:
         "subject_id": t.subject_id,
         "duration_minutes": t.duration_minutes,
         "is_active": t.is_active,
+        **_test_tool_flags(t),
         "created_by": t.created_by,
         "created_at": t.created_at.isoformat() + "Z",
         "updated_at": t.updated_at.isoformat() + "Z",
         "subjects": {"id": sub.id, "name": sub.name} if sub else None,
+        "test_sections": [_serialize_test_section(s) for s in secs],
         "test_questions": [
             {
                 "id": tq.id,
+                "section_id": tq.section_id,
                 "question_order": tq.question_order,
                 "questions": (
                     {
                         "id": tq.question.id,
                         "question_text": tq.question.question_text,
                         "points": tq.question.points,
+                        "subject_id": tq.question.subject_id,
+                        "language": _question_language(tq.question),
+                        "difficulty": _question_difficulty(tq.question),
                         "math": _math_public(tq.question),
-                        **_question_tool_flags(tq.question),
                     }
                     if tq.question
                     else None
@@ -1010,6 +1546,33 @@ def list_active_tests(db: Session = Depends(get_db), _: User = Depends(get_curre
     return out
 
 
+def _serialize_test_question_row(tq: TestQuestion, *, full: bool) -> dict:
+    q = tq.question
+    base = {
+        "id": tq.id,
+        "section_id": tq.section_id,
+        "question_order": tq.question_order,
+    }
+    if not q:
+        base["questions"] = None
+        return base
+    qdata: dict = {
+        "id": q.id,
+        "question_text": q.question_text,
+        "points": q.points,
+        "subject_id": q.subject_id,
+        "language": _question_language(q),
+        "difficulty": _question_difficulty(q),
+        "math": _math_public(q),
+    }
+    if full:
+        qdata["question_type"] = q.question_type
+        qdata["options"] = q.options
+        qdata["correct_answers"] = q.correct_answers
+    base["questions"] = qdata
+    return base
+
+
 @app.get("/tests/{test_id}")
 def get_test(test_id: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     t = db.get(Test, test_id)
@@ -1024,6 +1587,12 @@ def get_test(test_id: str, db: Session = Depends(get_db), user: User = Depends(g
         .options(joinedload(TestQuestion.question).joinedload(Question.math_content))
         .all()
     )
+    secs = (
+        db.query(TestSection)
+        .filter(TestSection.test_id == t.id)
+        .order_by(TestSection.section_order)
+        .all()
+    )
     sub = db.get(Subject, t.subject_id) if t.subject_id else None
     return {
         "id": t.id,
@@ -1032,31 +1601,13 @@ def get_test(test_id: str, db: Session = Depends(get_db), user: User = Depends(g
         "subject_id": t.subject_id,
         "duration_minutes": t.duration_minutes,
         "is_active": t.is_active,
+        **_test_tool_flags(t),
         "created_by": t.created_by,
         "created_at": t.created_at.isoformat() + "Z",
         "updated_at": t.updated_at.isoformat() + "Z",
         "subjects": {"name": sub.name} if sub else None,
-        "test_questions": [
-            {
-                "id": tq.id,
-                "question_order": tq.question_order,
-                "questions": (
-                    {
-                        "id": tq.question.id,
-                        "question_text": tq.question.question_text,
-                        "question_type": tq.question.question_type,
-                        "options": tq.question.options,
-                        "correct_answers": tq.question.correct_answers,
-                        "points": tq.question.points,
-                        "math": _math_public(tq.question),
-                        **_question_tool_flags(tq.question),
-                    }
-                    if tq.question
-                    else None
-                ),
-            }
-            for tq in tqs
-        ],
+        "test_sections": [_serialize_test_section(s) for s in secs],
+        "test_questions": [_serialize_test_question_row(tq, full=True) for tq in tqs],
     }
 
 
@@ -1090,45 +1641,113 @@ def in_progress_submission(test_id: str, db: Session = Depends(get_db), user: Us
 
 @app.post("/tests")
 def create_test(body: TestCreate, db: Session = Depends(get_db), user: User = Depends(require_admin)):
-    t = Test(
-        title=body.title.strip(),
-        description=(body.description or "").strip() or None,
-        subject_id=body.subject_id,
-        duration_minutes=body.duration_minutes,
-        is_active=body.is_active,
-        created_by=user.id,
-    )
-    db.add(t)
+    _validate_test_body(body)
+    if body.test_count > 1 and not body.sections:
+        raise HTTPException(400, detail="Batch creation requires section-based test builder")
+    if body.test_count > 1 and body.sections:
+        _validate_batch_questions_available(db, body.sections, body.test_count)
+
+    base_title = body.title.strip()
+    description = (body.description or "").strip() or None
+
+    if body.test_count == 1:
+        t = Test(
+            title=base_title,
+            description=description,
+            subject_id=body.subject_id if body.question_ids else None,
+            duration_minutes=body.duration_minutes,
+            is_active=body.is_active,
+            shuffle_answer_options=body.shuffle_answer_options,
+            show_calculator=body.show_calculator,
+            show_periodic_table=body.show_periodic_table,
+            proctoring_version=body.proctoring_version,
+            created_by=user.id,
+        )
+        db.add(t)
+        db.flush()
+        if body.sections:
+            _apply_test_sections(db, t, body.sections)
+        else:
+            _apply_manual_questions(db, t, body.question_ids or [])
+            if body.duration_minutes is None:
+                t.duration_minutes = 60
+        db.commit()
+        db.refresh(t)
+        return _serialize_test(t, db)
+
+    shared_exclude: set[str] = set()
+    created: list[dict] = []
+    for i in range(1, body.test_count + 1):
+        t = Test(
+            title=f"{base_title} {i}",
+            description=description,
+            subject_id=None,
+            duration_minutes=body.duration_minutes,
+            is_active=body.is_active,
+            shuffle_answer_options=body.shuffle_answer_options,
+            show_calculator=body.show_calculator,
+            show_periodic_table=body.show_periodic_table,
+            proctoring_version=body.proctoring_version,
+            created_by=user.id,
+        )
+        db.add(t)
+        db.flush()
+        _apply_test_sections(db, t, body.sections or [], exclude=shared_exclude)
+        created.append(_serialize_test(t, db))
     db.commit()
-    db.refresh(t)
-    for i, qid in enumerate(body.question_ids):
-        db.add(TestQuestion(test_id=t.id, question_id=qid, question_order=i))
-    db.commit()
-    return _serialize_test(t, db)
+    return {"tests": created, "created_count": len(created)}
 
 
 class TestUpdate(BaseModel):
     title: str
     description: str | None = None
     subject_id: str | None = None
-    duration_minutes: int = 60
+    duration_minutes: int | None = None
     is_active: bool = False
-    question_ids: list[str]
+    shuffle_answer_options: bool = False
+    show_calculator: bool = False
+    show_periodic_table: bool = False
+    proctoring_version: int = 0
+    question_ids: list[str] | None = None
+    sections: list[TestSectionInput] | None = None
+    regenerate_questions: bool = False
+
+
+def _validate_test_body(body: TestCreate | TestUpdate) -> None:
+    if body.proctoring_version not in (0, 1, 3):
+        raise HTTPException(400, detail="proctoring_version must be 0 (off), 1 (camera+screen), or 3 (AI)")
+    has_sections = bool(body.sections)
+    has_manual = bool(body.question_ids)
+    if has_sections == has_manual:
+        raise HTTPException(
+            400,
+            detail="Provide either sections (random builder) or question_ids (manual), not both.",
+        )
 
 
 @app.patch("/tests/{test_id}")
 def update_test(test_id: str, body: TestUpdate, db: Session = Depends(get_db), _: User = Depends(require_admin)):
+    _validate_test_body(body)
     t = db.get(Test, test_id)
     if not t:
         raise HTTPException(404, "Not found")
     t.title = body.title.strip()
     t.description = (body.description or "").strip() or None
-    t.subject_id = body.subject_id
-    t.duration_minutes = body.duration_minutes
     t.is_active = body.is_active
-    db.query(TestQuestion).filter(TestQuestion.test_id == t.id).delete()
-    for i, qid in enumerate(body.question_ids):
-        db.add(TestQuestion(test_id=t.id, question_id=qid, question_order=i))
+    t.shuffle_answer_options = body.shuffle_answer_options
+    t.show_calculator = body.show_calculator
+    t.show_periodic_table = body.show_periodic_table
+    t.proctoring_version = body.proctoring_version
+    if body.sections:
+        t.subject_id = None
+        if body.regenerate_questions or not db.query(TestSection).filter(TestSection.test_id == t.id).first():
+            _apply_test_sections(db, t, body.sections)
+        else:
+            _update_sections_metadata(db, t, body.sections)
+    else:
+        t.subject_id = body.subject_id
+        t.duration_minutes = body.duration_minutes if body.duration_minutes is not None else 60
+        _apply_manual_questions(db, t, body.question_ids or [])
     db.commit()
     return _serialize_test(t, db)
 
@@ -1229,7 +1848,7 @@ def _serialize_submission(s: Submission, db: Session, include_test: bool = False
         "percentage": s.percentage,
         "started_at": s.started_at.isoformat() + "Z",
         "submitted_at": s.submitted_at.isoformat() + "Z" if s.submitted_at else None,
-        "profiles": {"name": student.name, "email": student.email} if student else None,
+        "profiles": {"name": student.name, "email": student.email, "phone": student.phone} if student else None,
     }
     if include_test:
         t = db.get(Test, s.test_id)
@@ -1318,7 +1937,7 @@ def admin_completed_submissions(db: Session = Depends(get_db), _: User = Depends
         out.append(
             {
                 **{k: v for k, v in _serialize_submission(s, db).items() if k != "profiles"},
-                "profiles": {"name": stu.name if stu else None, "email": stu.email if stu else None},
+                "profiles": {"name": stu.name if stu else None, "email": stu.email if stu else None, "phone": stu.phone if stu else None},
                 "tests": {"title": t.title if t else None, "subjects": {"name": subj_name} if subj_name else None},
             }
         )
@@ -1359,7 +1978,7 @@ def get_submission(submission_id: str, db: Session = Depends(get_db), user: User
         "percentage": s.percentage,
         "started_at": s.started_at.isoformat() + "Z",
         "submitted_at": s.submitted_at.isoformat() + "Z" if s.submitted_at else None,
-        "profiles": {"name": student.name, "email": student.email} if student else None,
+        "profiles": {"name": student.name, "email": student.email, "phone": student.phone} if student else None,
         "question_reports": [_serialize_question_report(r) for r in reports],
         "tests": {
             "id": t.id,
@@ -1368,12 +1987,14 @@ def get_submission(submission_id: str, db: Session = Depends(get_db), user: User
             "subject_id": t.subject_id,
             "duration_minutes": t.duration_minutes,
             "is_active": t.is_active,
+            **_test_tool_flags(t),
             "created_at": t.created_at.isoformat() + "Z",
             "updated_at": t.updated_at.isoformat() + "Z",
             "test_questions": [
                 {
                     "id": tq.id,
                     "question_order": tq.question_order,
+                    "section_id": tq.section_id,
                     "questions": (
                         {
                             "id": tq.question.id,
@@ -1383,11 +2004,12 @@ def get_submission(submission_id: str, db: Session = Depends(get_db), user: User
                             "options": tq.question.options,
                             "correct_answers": tq.question.correct_answers,
                             "points": tq.question.points,
+                            "language": _question_language(tq.question),
+                            "difficulty": _question_difficulty(tq.question),
                             "created_by": tq.question.created_by,
                             "created_at": tq.question.created_at.isoformat() + "Z",
                             "updated_at": tq.question.updated_at.isoformat() + "Z",
                             "math": _math_public(tq.question),
-                            **_question_tool_flags(tq.question),
                         }
                         if tq.question
                         else None
@@ -1395,8 +2017,65 @@ def get_submission(submission_id: str, db: Session = Depends(get_db), user: User
                 }
                 for tq in tqs
             ],
+            "test_sections": [
+                _serialize_test_section(sec)
+                for sec in sorted(t.sections, key=lambda s: s.section_order)
+            ],
         },
     }
+
+
+class ExplainAnswerBody(BaseModel):
+    locale: str = "ru"
+
+
+@app.post("/submissions/{submission_id}/questions/{question_id}/explain")
+def explain_submission_question(
+    submission_id: str,
+    question_id: str,
+    body: ExplainAnswerBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if not settings.openai_api_key:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Explanation is not configured",
+        )
+    s = db.get(Submission, submission_id)
+    if not s:
+        raise HTTPException(404, "Not found")
+    if user.role != "admin" and s.student_id != user.id:
+        raise HTTPException(403, "Forbidden")
+    if not s.submitted_at:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Submit the test before requesting an explanation")
+
+    tq = (
+        db.query(TestQuestion)
+        .filter(TestQuestion.test_id == s.test_id, TestQuestion.question_id == question_id)
+        .options(joinedload(TestQuestion.question).joinedload(Question.math_content))
+        .first()
+    )
+    if not tq or not tq.question:
+        raise HTTPException(404, "Question is not part of this test")
+
+    question = tq.question
+    subject = db.get(Subject, question.subject_id) if question.subject_id else None
+    test = db.get(Test, s.test_id)
+    answers = s.answers if isinstance(s.answers, dict) else {}
+    try:
+        text = explain_question(
+            question=question,
+            subject_name=subject.name if subject else None,
+            test_title=test.title if test else None,
+            student_answer=answers.get(question_id),
+            locale=normalize_explain_locale(body.locale),
+            upload_root=UPLOAD_ROOT,
+        )
+    except Exception:
+        _log.exception("explain failed submission=%s question=%s", submission_id, question_id)
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, "Could not explain this question")
+    return {"explanation": text}
 
 
 @app.post("/submissions")
@@ -1406,13 +2085,13 @@ def create_submission(body: SubmissionCreate, db: Session = Depends(get_db), use
     t = db.get(Test, body.test_id)
     if not t or not t.is_active:
         raise HTTPException(404, "Test not found")
-    max_score = (
-        db.query(func.coalesce(func.sum(Question.points), 0))
+    test_questions = (
+        db.query(Question)
         .join(TestQuestion, TestQuestion.question_id == Question.id)
         .filter(TestQuestion.test_id == t.id)
-        .scalar()
+        .all()
     )
-    max_score = int(max_score or 0)
+    max_score = sum(_question_max_points(q) for q in test_questions)
     s = Submission(student_id=user.id, test_id=t.id, answers={}, max_score=max_score)
     db.add(s)
     db.commit()
@@ -1542,6 +2221,7 @@ def list_question_reports(
                 "reporter": {
                     "name": reporter.name if reporter else None,
                     "email": reporter.email if reporter else None,
+                    "phone": reporter.phone if reporter else None,
                 },
                 "test": {"id": test.id, "title": test.title} if test else None,
                 "submission_id": r.submission_id,
@@ -1604,7 +2284,7 @@ def admin_dashboard(db: Session = Depends(get_db), _: User = Depends(require_adm
                 "id": s.id,
                 "percentage": s.percentage,
                 "submitted_at": s.submitted_at.isoformat() + "Z" if s.submitted_at else None,
-                "profiles": {"name": stu.name if stu else None, "email": stu.email if stu else None},
+                "profiles": {"name": stu.name if stu else None, "email": stu.email if stu else None, "phone": stu.phone if stu else None},
                 "tests": {"title": t.title if t else None},
             }
         )

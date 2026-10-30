@@ -1,3 +1,4 @@
+import re
 import secrets
 
 from sqlalchemy import text
@@ -6,9 +7,41 @@ from sqlalchemy.orm import Session
 from app.models import User
 
 
+def _rebuild_users_email_nullable(conn) -> None:
+    """SQLite cannot drop NOT NULL in place: recreate users with a nullable email, keeping rows and indexes."""
+    if conn.execute(text("PRAGMA foreign_keys")).scalar():
+        # DROP TABLE would cascade into submissions etc.
+        raise RuntimeError("migrate_users: refusing to rebuild users while PRAGMA foreign_keys is ON")
+    create_sql = conn.execute(text("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'")).scalar()
+    new_sql, n = re.subn(r"\bemail VARCHAR\(255\) NOT NULL", "email VARCHAR(255)", create_sql)
+    if n != 1:
+        raise RuntimeError("migrate_users: unexpected users schema, cannot make email nullable")
+    new_sql = new_sql.replace("CREATE TABLE users", "CREATE TABLE users__new", 1)
+    index_sqls = [
+        r[0]
+        for r in conn.execute(
+            text("SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='users' AND sql IS NOT NULL")
+        ).fetchall()
+    ]
+    conn.execute(text(new_sql))
+    conn.execute(text("INSERT INTO users__new SELECT * FROM users"))
+    conn.execute(text("DROP TABLE users"))
+    conn.execute(text("ALTER TABLE users__new RENAME TO users"))
+    for stmt in index_sqls:
+        conn.execute(text(stmt))
+
+
 def migrate_users(engine) -> None:
     """SQLite: add new user columns if missing; backfill legacy rows."""
     with engine.begin() as conn:
+        email_col = next(
+            (r for r in conn.execute(text("PRAGMA table_info(users)")).fetchall() if r[1] == "email"), None
+        )
+        if email_col is not None and email_col[3]:  # notnull
+            _rebuild_users_email_nullable(conn)
+        if "phone" not in {r[1] for r in conn.execute(text("PRAGMA table_info(users)")).fetchall()}:
+            conn.execute(text("ALTER TABLE users ADD COLUMN phone VARCHAR(20)"))
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_users_phone ON users (phone)"))
         rows = conn.execute(text("PRAGMA table_info(users)")).fetchall()
         cols = {r[1] for r in rows}
         statements = [
@@ -92,10 +125,75 @@ def migrate_questions(engine) -> None:
             ("shuffle_answer_options", "ALTER TABLE questions ADD COLUMN shuffle_answer_options BOOLEAN DEFAULT 0"),
             ("show_calculator", "ALTER TABLE questions ADD COLUMN show_calculator BOOLEAN DEFAULT 0"),
             ("show_periodic_table", "ALTER TABLE questions ADD COLUMN show_periodic_table BOOLEAN DEFAULT 0"),
+            ("language", "ALTER TABLE questions ADD COLUMN language VARCHAR(16) DEFAULT 'russian'"),
+            ("difficulty", "ALTER TABLE questions ADD COLUMN difficulty VARCHAR(1) DEFAULT 'B'"),
         ]
         for col, stmt in statements:
             if col not in cols:
                 conn.execute(text(stmt))
+        cols_after = {r[1] for r in conn.execute(text("PRAGMA table_info(questions)")).fetchall()}
+        if "language" in cols_after:
+            conn.execute(text("UPDATE questions SET language = 'russian' WHERE language IS NULL OR language = ''"))
+        if "difficulty" in cols_after:
+            conn.execute(text("UPDATE questions SET difficulty = 'B' WHERE difficulty IS NULL OR difficulty = ''"))
+
+
+def migrate_tests(engine) -> None:
+    """SQLite: add test-level tool columns if missing."""
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(tests)")).fetchall()
+        cols = {r[1] for r in rows}
+        statements = [
+            ("shuffle_answer_options", "ALTER TABLE tests ADD COLUMN shuffle_answer_options BOOLEAN DEFAULT 0"),
+            ("show_calculator", "ALTER TABLE tests ADD COLUMN show_calculator BOOLEAN DEFAULT 0"),
+            ("show_periodic_table", "ALTER TABLE tests ADD COLUMN show_periodic_table BOOLEAN DEFAULT 0"),
+            ("proctoring_version", "ALTER TABLE tests ADD COLUMN proctoring_version INTEGER DEFAULT 0"),
+        ]
+        for col, stmt in statements:
+            if col not in cols:
+                conn.execute(text(stmt))
+
+
+def migrate_test_sections(engine) -> None:
+    """SQLite: test_sections table and test_questions.section_id."""
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as conn:
+        tables = {
+            r[0]
+            for r in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            ).fetchall()
+        }
+        if "test_sections" not in tables:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE test_sections (
+                        id VARCHAR(36) PRIMARY KEY,
+                        test_id VARCHAR(36) NOT NULL,
+                        name VARCHAR(500) NOT NULL,
+                        duration_minutes INTEGER NOT NULL DEFAULT 30,
+                        section_order INTEGER NOT NULL DEFAULT 0,
+                        subject_picks JSON NOT NULL DEFAULT '[]',
+                        FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                text("CREATE INDEX IF NOT EXISTS ix_test_sections_test_id ON test_sections (test_id)")
+            )
+        tq_cols = {r[1] for r in conn.execute(text("PRAGMA table_info(test_questions)")).fetchall()}
+        if "section_id" not in tq_cols:
+            conn.execute(
+                text(
+                    "ALTER TABLE test_questions ADD COLUMN section_id VARCHAR(36) "
+                    "REFERENCES test_sections(id) ON DELETE SET NULL"
+                )
+            )
 
 
 def migrate_question_reports(engine) -> None:
@@ -141,3 +239,103 @@ def migrate_question_reports(engine) -> None:
         conn.execute(
             text("CREATE INDEX IF NOT EXISTS ix_question_reports_question_id ON question_reports (question_id)")
         )
+
+
+def migrate_proctoring(engine) -> None:
+    """SQLite tables for olymp-app-style proctoring artifacts."""
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as conn:
+        tables = {
+            r[0]
+            for r in conn.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table'")
+            ).fetchall()
+        }
+        if "proctoring_reports" not in tables:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE proctoring_reports (
+                        id VARCHAR(36) PRIMARY KEY,
+                        submission_id VARCHAR(36) NOT NULL,
+                        student_id VARCHAR(36) NOT NULL,
+                        test_id VARCHAR(36) NOT NULL,
+                        type VARCHAR(64) NOT NULL,
+                        timecode VARCHAR(32) NOT NULL DEFAULT '',
+                        filename VARCHAR(255) NOT NULL DEFAULT '',
+                        description TEXT,
+                        created_at DATETIME NOT NULL,
+                        FOREIGN KEY(submission_id) REFERENCES submissions(id) ON DELETE CASCADE,
+                        FOREIGN KEY(student_id) REFERENCES users(id) ON DELETE CASCADE,
+                        FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_proctoring_reports_submission_id "
+                    "ON proctoring_reports (submission_id)"
+                )
+            )
+        if "proctoring_detection_logs" not in tables:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE proctoring_detection_logs (
+                        id VARCHAR(36) PRIMARY KEY,
+                        submission_id VARCHAR(36) NOT NULL,
+                        student_id VARCHAR(36) NOT NULL,
+                        test_id VARCHAR(36) NOT NULL,
+                        filename VARCHAR(255) NOT NULL DEFAULT '',
+                        start_timecode VARCHAR(32) NOT NULL DEFAULT '',
+                        logs TEXT NOT NULL DEFAULT '',
+                        created_at DATETIME NOT NULL,
+                        FOREIGN KEY(submission_id) REFERENCES submissions(id) ON DELETE CASCADE,
+                        FOREIGN KEY(student_id) REFERENCES users(id) ON DELETE CASCADE,
+                        FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_proctoring_detection_logs_submission_id "
+                    "ON proctoring_detection_logs (submission_id)"
+                )
+            )
+        if "proctoring_chunks" not in tables:
+            conn.execute(
+                text(
+                    """
+                    CREATE TABLE proctoring_chunks (
+                        id VARCHAR(36) PRIMARY KEY,
+                        submission_id VARCHAR(36) NOT NULL,
+                        student_id VARCHAR(36) NOT NULL,
+                        test_id VARCHAR(36) NOT NULL,
+                        source VARCHAR(32) NOT NULL,
+                        file_name VARCHAR(255) NOT NULL,
+                        url VARCHAR(500) NOT NULL,
+                        size_bytes INTEGER NOT NULL DEFAULT 0,
+                        is_final BOOLEAN NOT NULL DEFAULT 0,
+                        created_at DATETIME NOT NULL,
+                        FOREIGN KEY(submission_id) REFERENCES submissions(id) ON DELETE CASCADE,
+                        FOREIGN KEY(student_id) REFERENCES users(id) ON DELETE CASCADE,
+                        FOREIGN KEY(test_id) REFERENCES tests(id) ON DELETE CASCADE
+                    )
+                    """
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_proctoring_chunks_submission_id "
+                    "ON proctoring_chunks (submission_id)"
+                )
+            )
+            conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_proctoring_chunks_file_name "
+                    "ON proctoring_chunks (file_name)"
+                )
+            )

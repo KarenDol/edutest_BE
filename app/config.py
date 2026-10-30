@@ -45,6 +45,21 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_CLIENT_ID"),
     )
+    # Telegram Gateway API token (https://gateway.telegram.org) — sends phone verification codes.
+    telegram_gateway_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("TELEGRAM_GATEWAY_TOKEN", "TELEGRAM_GATEAWAY_TOKEN"),
+    )
+    # Meta WhatsApp Cloud API webhook: verify token you type in the Meta app dashboard, and the app secret
+    # (App settings → Basic) used to check the X-Hub-Signature-256 header on incoming events.
+    whatsapp_verify_token: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("WHATSAPP_VERIFY_TOKEN"),
+    )
+    whatsapp_app_secret: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("WHATSAPP_APP_SECRET", "META_APP_SECRET"),
+    )
     public_app_base_url: str | None = Field(
         default=None,
         validation_alias=AliasChoices("PUBLIC_APP_BASE_URL", "APP_PUBLIC_URL"),

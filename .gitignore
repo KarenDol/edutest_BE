@@ -10,3 +10,5 @@ data/
 htmlcov/
 .DS_Store
 *.textClipping
+*.db.bak*
+deploy/acme-txt.txt

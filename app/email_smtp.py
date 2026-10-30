@@ -89,7 +89,7 @@ def notify_admins_new_student(
     settings: Settings,
     *,
     student_name: str,
-    student_email: str,
+    student_phone: str,
     user_id: str,
 ) -> None:
     recipients = settings.email_approval_notify_recipients
@@ -103,7 +103,7 @@ def notify_admins_new_student(
         return
 
     safe_name = html.escape(student_name)
-    safe_email = html.escape(student_email)
+    safe_phone = html.escape(student_phone)
     safe_id = html.escape(user_id)
     base = (settings.public_app_base_url or "").rstrip("/")
     link_line = ""
@@ -113,15 +113,14 @@ def notify_admins_new_student(
 
     subject = "[EduTest by Narxoz] New student registered"
     intro = (
-        "<p>A new student registered. They must <strong>confirm their own email</strong> using the link we sent "
-        "to their inbox before they can sign in.</p>"
+        "<p>A new student registered with a phone number confirmed via Telegram.</p>"
     )
 
     body = f"""<html><body>
 {intro}
 <ul>
   <li><strong>Name:</strong> {safe_name}</li>
-  <li><strong>Email:</strong> {safe_email}</li>
+  <li><strong>Phone:</strong> {safe_phone}</li>
   <li><strong>User id:</strong> {safe_id}</li>
 </ul>
 {link_line}
