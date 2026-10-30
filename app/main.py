@@ -45,7 +45,7 @@ from app.email_smtp import (
     notify_admins_new_student,
     notify_student_email_verification,
 )
-from app import telegram_gateway
+from app import phone_otp, telegram_gateway
 from app.models import (
     ProctoringChunk,
     ProctoringDetectionLog,
@@ -55,6 +55,7 @@ from app.models import (
     QuestionReport,
     PhoneVerification,
     Subject,
+    TelegramBotSession,
     Submission,
     Test,
     TestQuestion,
@@ -93,7 +94,7 @@ async def lifespan(_: FastAPI):
     migrate_proctoring(engine)
     log_email_startup_hints(settings)
     _log.info(
-        "Student sign-up verifies the phone number with a Telegram code (TELEGRAM_GATEWAY_TOKEN). "
+        "Student sign-up verifies the phone number with a code (CASCADE_API_KEY or TELEGRAM_GATEWAY_TOKEN). "
         "(No administrator approval.)"
     )
     with Session(engine) as db:
@@ -173,11 +174,11 @@ class PhoneCodeVerifyResponse(BaseModel):
 
 @app.post("/auth/phone/send-code", response_model=PhoneCodeSendResponse)
 def send_phone_code(body: PhoneCodeSendBody, request: Request, db: Session = Depends(get_db)):
-    """Send a Telegram verification code for sign-up or password reset."""
-    if not telegram_gateway.is_configured():
+    """Send a verification code (Cascade or Telegram Gateway) for sign-up or password reset."""
+    if not phone_otp.is_configured():
         raise HTTPException(
             status_code=503,
-            detail="Phone verification is not configured (set TELEGRAM_GATEWAY_TOKEN on the API).",
+            detail="Phone verification is not configured (set CASCADE_API_KEY or TELEGRAM_GATEWAY_TOKEN on the API).",
         )
     phone = telegram_gateway.normalize_phone(body.phone)
     if not phone:
@@ -216,21 +217,18 @@ def send_phone_code(body: PhoneCodeSendBody, request: Request, db: Session = Dep
         raise HTTPException(status_code=429, detail="Too many codes requested. Try again later.")
 
     try:
-        result = telegram_gateway.send_verification_message(phone, ttl=PHONE_CODE_TTL_SECONDS)
-    except telegram_gateway.GatewayError as e:
-        if e.code.startswith("PHONE_NUMBER"):
-            raise HTTPException(
-                status_code=400,
-                detail="Could not send a code to this number. Check the number and make sure it has a Telegram account.",
-            ) from None
+        request_id = phone_otp.send_code(phone, body.purpose, PHONE_CODE_TTL_SECONDS)
+    except phone_otp.OtpSendError as e:
+        if e.user_message:
+            raise HTTPException(status_code=429 if e.rate_limited else 400, detail=e.user_message) from None
         raise HTTPException(
-            status_code=502, detail="Telegram verification is temporarily unavailable. Try again later."
+            status_code=502, detail="Phone verification is temporarily unavailable. Try again later."
         ) from None
 
     v = PhoneVerification(
         phone=phone,
         purpose=body.purpose,
-        request_id=str(result["request_id"]),
+        request_id=request_id,
         client_ip=client_ip,
         expires_at=now + timedelta(seconds=PHONE_CODE_TTL_SECONDS),
     )
@@ -246,7 +244,7 @@ def send_phone_code(body: PhoneCodeSendBody, request: Request, db: Session = Dep
 
 @app.post("/auth/phone/verify", response_model=PhoneCodeVerifyResponse)
 def verify_phone_code(body: PhoneCodeVerifyBody, db: Session = Depends(get_db)):
-    """Check the code with Telegram; on success return a one-time token for /auth/register or /auth/reset-password."""
+    """Check the code with the provider; on success return a one-time token for /auth/register or /auth/reset-password."""
     v = db.get(PhoneVerification, body.verification_id)
     if not v or v.verified_at is not None:
         raise HTTPException(status_code=400, detail="Invalid or expired code. Request a new one.")
@@ -257,15 +255,14 @@ def verify_phone_code(body: PhoneCodeVerifyBody, db: Session = Depends(get_db)):
     v.attempts += 1
     db.commit()
     try:
-        result = telegram_gateway.check_verification_status(v.request_id, body.code)
-    except telegram_gateway.GatewayError:
+        code_status = phone_otp.check_code(v.request_id, v.phone, v.purpose, body.code)
+    except phone_otp.OtpCheckError:
         raise HTTPException(
-            status_code=502, detail="Telegram verification is temporarily unavailable. Try again later."
+            status_code=502, detail="Phone verification is temporarily unavailable. Try again later."
         ) from None
-    code_status = (result.get("verification_status") or {}).get("status")
-    if code_status == "code_invalid":
+    if code_status == "invalid":
         raise HTTPException(status_code=400, detail="Incorrect code")
-    if code_status != "code_valid":
+    if code_status != "valid":
         v.attempts = PHONE_CODE_MAX_ATTEMPTS
         db.commit()
         raise HTTPException(
@@ -278,6 +275,83 @@ def verify_phone_code(body: PhoneCodeVerifyBody, db: Session = Depends(get_db)):
     v.token_expires_at = v.verified_at + timedelta(minutes=PHONE_TOKEN_TTL_MINUTES)
     db.commit()
     return PhoneCodeVerifyResponse(verification_token=raw, phone=v.phone)
+
+
+TG_BOT_SESSION_TTL_MINUTES = 10
+TG_BOT_MAX_SESSIONS_PER_IP_HOUR = 300  # free, and schools share one IP
+_TG_BOT_ERRORS = {
+    "phone_registered": "This phone number is already registered. Log in instead.",
+    "phone_not_registered": "No account with this phone number",
+}
+
+
+class TelegramBotStartBody(BaseModel):
+    purpose: Literal["register", "reset"]
+
+
+class TelegramBotStartResponse(BaseModel):
+    session_id: str
+    poll_secret: str
+    bot_url: str
+    expires_in: int
+
+
+class TelegramBotPollBody(BaseModel):
+    session_id: str = Field(min_length=1, max_length=36)
+    poll_secret: str = Field(min_length=16, max_length=128)
+
+
+@app.post("/auth/telegram/start", response_model=TelegramBotStartResponse)
+def start_telegram_bot_verification(body: TelegramBotStartBody, request: Request, db: Session = Depends(get_db)):
+    """Start phone verification via @bot: the student opens bot_url and shares their contact there."""
+    if not (settings.telegram_bot_token or "").strip():
+        raise HTTPException(status_code=503, detail="Telegram bot is not configured (set TELEGRAM_BOT_TOKEN on the API).")
+    now = datetime.utcnow()
+    client_ip = request.client.host if request.client else None
+    if client_ip:
+        recent = (
+            db.query(TelegramBotSession)
+            .filter(TelegramBotSession.client_ip == client_ip, TelegramBotSession.created_at > now - timedelta(hours=1))
+            .count()
+        )
+        if recent >= TG_BOT_MAX_SESSIONS_PER_IP_HOUR:
+            raise HTTPException(status_code=429, detail="Too many attempts. Try again later.")
+    nonce = secrets.token_urlsafe(24)  # Telegram /start payload: [A-Za-z0-9_-], max 64 chars
+    poll_secret = secrets.token_urlsafe(32)
+    s = TelegramBotSession(
+        purpose=body.purpose,
+        start_nonce=nonce,
+        poll_secret_hash=hashlib.sha256(poll_secret.encode()).hexdigest(),
+        client_ip=client_ip,
+        expires_at=now + timedelta(minutes=TG_BOT_SESSION_TTL_MINUTES),
+    )
+    db.add(s)
+    db.commit()
+    return TelegramBotStartResponse(
+        session_id=s.id,
+        poll_secret=poll_secret,
+        bot_url=f"https://t.me/{settings.telegram_bot_username}?start={nonce}",
+        expires_in=TG_BOT_SESSION_TTL_MINUTES * 60,
+    )
+
+
+@app.post("/auth/telegram/poll")
+def poll_telegram_bot_verification(body: TelegramBotPollBody, db: Session = Depends(get_db)):
+    """status: pending | verified (with a one-time verification_token, returned once) | error | expired."""
+    s = db.get(TelegramBotSession, body.session_id)
+    if not s or not secrets.compare_digest(
+        s.poll_secret_hash, hashlib.sha256(body.poll_secret.encode()).hexdigest()
+    ):
+        raise HTTPException(status_code=404, detail="Session not found")
+    if s.error:
+        return {"status": "error", "detail": _TG_BOT_ERRORS.get(s.error, "Verification failed")}
+    if s.pending_token:
+        token, s.pending_token = s.pending_token, None
+        db.commit()
+        return {"status": "verified", "verification_token": token, "phone": s.phone}
+    if s.completed_at or datetime.utcnow() > s.expires_at:
+        return {"status": "expired"}
+    return {"status": "pending"}
 
 
 def _verified_phone(db: Session, verification_token: str, purpose: str) -> PhoneVerification:

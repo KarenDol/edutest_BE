@@ -50,6 +50,26 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("TELEGRAM_GATEWAY_TOKEN", "TELEGRAM_GATEAWAY_TOKEN"),
     )
+    # Telegram bot (@edutest_narxoz_bot): students share their phone contact with the bot to verify it.
+    # Run the bot with `python -m app.telegram_bot` (long polling, no inbound webhook needed).
+    telegram_bot_token: str | None = Field(default=None, validation_alias=AliasChoices("TELEGRAM_BOT_TOKEN"))
+    telegram_bot_username: str = Field(
+        default="edutest_narxoz_bot", validation_alias=AliasChoices("TELEGRAM_BOT_USERNAME")
+    )
+    # Cascade OTP API (https://docs.cascade.kz). When CASCADE_API_KEY is set, phone codes go through
+    # Cascade instead of the Telegram Gateway.
+    cascade_api_key: str | None = Field(default=None, validation_alias=AliasChoices("CASCADE_API_KEY"))
+    cascade_client_domain: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("CASCADE_CLIENT_DOMAIN"),
+        description="Domain the API key is bound to; defaults to the PUBLIC_APP_BASE_URL host.",
+    )
+    cascade_channel: str = Field(
+        default="telegram",
+        validation_alias=AliasChoices("CASCADE_CHANNEL"),
+        description="telegram | whatsapp | auto",
+    )
+    cascade_locale: str = Field(default="ru", validation_alias=AliasChoices("CASCADE_LOCALE"))
     # Meta WhatsApp Cloud API webhook: verify token you type in the Meta app dashboard, and the app secret
     # (App settings → Basic) used to check the X-Hub-Signature-256 header on incoming events.
     whatsapp_verify_token: str | None = Field(

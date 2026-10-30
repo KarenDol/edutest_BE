@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, JSON, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, JSON, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -53,6 +53,29 @@ class PhoneVerification(Base):
     token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     token_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     consumed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class TelegramBotSession(Base):
+    """Browser ↔ Telegram bot handshake: the student opens t.me/<bot>?start=<start_nonce> and shares their contact.
+
+    The browser polls with ``poll_secret``; once the bot has the phone it creates a verified PhoneVerification
+    and parks its one-time token here until the browser picks it up.
+    """
+
+    __tablename__ = "telegram_bot_sessions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
+    purpose: Mapped[str] = mapped_column(String(16))  # register | reset
+    start_nonce: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    poll_secret_hash: Mapped[str] = mapped_column(String(64))
+    client_ip: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    telegram_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    phone: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    error: Mapped[str | None] = mapped_column(String(32), nullable=True)  # phone_registered | phone_not_registered
+    pending_token: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
